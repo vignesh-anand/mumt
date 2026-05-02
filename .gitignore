@@ -1,0 +1,28 @@
+# venv
+.venv/
+
+# habitat source clones (we treat them as opaque dependencies)
+third_party/
+
+# data assets (large, gated, not re-distributable)
+data/
+
+# render outputs
+renders/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

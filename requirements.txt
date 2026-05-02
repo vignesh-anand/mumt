@@ -1,0 +1,5 @@
+numpy
+imageio
+huggingface_hub[cli]
+hydra-core
+omegaconf

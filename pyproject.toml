@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mumt_sim"
+version = "0.1.0"
+description = "Habitat 3 sim with 2 Spot-like robots and 1 humanoid in HSSD; eventual VR via HITL."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "imageio",
+]
+
+[tool.setuptools.packages.find]
+include = ["mumt_sim*"]
+exclude = ["third_party*", "data*", "renders*", "scripts*"]
