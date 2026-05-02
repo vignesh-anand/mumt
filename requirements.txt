@@ -3,4 +3,4 @@ imageio
 huggingface_hub[cli]
 hydra-core
 omegaconf
-pygame>=2.5
+opencv-python>=4.8

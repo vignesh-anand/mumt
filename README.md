@@ -161,8 +161,9 @@ source .venv/bin/activate
 python scripts/teleop_spot.py
 ```
 
-Opens an 1280x480 window: Spot 0's head RGB on the left, observer bird's-eye on
-the right, with a small HUD showing position, yaw, pan, tilt, fps. Controls:
+Opens a 1280x480 OpenCV window: Spot 0's head RGB on the left, observer bird's-eye
+on the right, with a small HUD showing position, yaw, pan, tilt, fps. Click the
+window once after it appears so it has keyboard focus. Controls:
 
 | Key            | Action                                                |
 | -------------- | ----------------------------------------------------- |
@@ -176,29 +177,40 @@ the right, with a small HUD showing position, yaw, pan, tilt, fps. Controls:
 
 **Conventions established here:**
 
-- Teleop modules know nothing about pygame. Drivers fill a
+- Teleop modules are framework-agnostic. Drivers fill a
   ``mumt_sim.teleop.TeleopInput`` per frame and call ``SpotTeleop.step(dt, controls)``.
-  Same pattern will let an OpenXR / VR controller driver feed the same teleop in M3.
+  The window emits a ``mumt_sim.display.InputState`` (semantic axis flags) and
+  the script translates between the two. Same pattern will let an OpenXR / VR
+  controller driver drop in for M3 without touching ``teleop.py``.
 - Live render resolution (480x640 per panel) is a separate concern from the
   offline render resolution (M1 still uses 720x1280). Pass ``image_hw`` to
   ``mumt_sim.scene.make_sim`` per use case.
 - Body XZ motion gets clamped against walls via ``pathfinder.try_step`` (sliding
   contact). Yaw, pan, and tilt are unconstrained except for tilt's hard plus-or-minus
   60 deg clamp inside ``mumt_sim/teleop.py``.
+- Live windowing uses **OpenCV**, not pygame (see problem below). cv2 keys are
+  emulated as held via a 120 ms last-seen window in ``SplitScreenWindow.poll_input``.
 
 **Problems hit and how we solved them:**
 
+- Pygame's window segfaulted habitat-sim's renderer on the first
+  ``get_sensor_observations`` after ``pygame.display.set_mode`` (NVIDIA GLX
+  context conflict; visible as ``nv-implementation-color-read-format-dsa-broken``
+  in Magnum's workaround log)
+  -> dropped pygame entirely; ``mumt_sim/display.py`` now uses
+     ``cv2.imshow`` + ``cv2.waitKeyEx``. cv2's GTK/Qt window has no GL state of
+     its own so habitat-sim keeps its context.
+- cv2 has no native held-key state (only one-shot ``waitKey`` events)
+  -> emulate held-state via a per-keycode last-seen timestamp + 120 ms hold
+     window in ``SplitScreenWindow.poll_input``. Linux key auto-repeat keeps
+     the timestamp fresh while the key is physically down. Initial press has a
+     ~250 ms OS-level delay; that's a known limitation, swap in ``pynput`` for
+     a proper global listener if it bites in M2b/c.
 - ``Quaternion.angle()`` always returns [0, pi] so reading initial yaw from the
   Spot AO loses sign
   -> reconstruct sign from ``rotation.axis().y`` in ``SpotTeleop.__init__``.
-- pygame-side numpy arrays must be transposed: habitat hands us ``(H, W, 3)``,
-  pygame expects ``(W, H, 3)``
-  -> handled inside ``SplitScreenWindow._to_surface``.
-- Stale ``timeout`` invocations during smoke-testing didn't kill pygame loops
-  cleanly
-  -> not a code issue, just confirmed clean exit on ``Esc`` / window close in
-     ``scripts/teleop_spot.py``'s ``finally`` block (``window.close``,
-     ``sim.close``).
+- habitat hands us ``(H, W, RGBA)`` uint8, cv2 wants BGR
+  -> ``SplitScreenWindow._to_bgr`` strips alpha and runs ``COLOR_RGB2BGR``.
 
 **What we deliberately punted:**
 

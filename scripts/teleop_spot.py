@@ -19,13 +19,12 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pygame
 
 import habitat_sim
 import magnum as mn
 
 from mumt_sim.agents import add_kinematic_humanoid, add_kinematic_spot
-from mumt_sim.display import SplitScreenWindow
+from mumt_sim.display import InputState, SplitScreenWindow
 from mumt_sim.pan_tilt import PanTiltHead
 from mumt_sim.scene import (
     OBSERVER_AGENT_ID,
@@ -72,19 +71,19 @@ def _yaw_facing(src_xyz, target_xz) -> float:
     return math.atan2(-dz, dx)
 
 
-def _build_input(keys, reset_pressed: bool) -> TeleopInput:
-    """Translate a pygame held-key snapshot into a ``TeleopInput``."""
+def _build_input(state: InputState) -> TeleopInput:
+    """Translate a window ``InputState`` into the framework-agnostic ``TeleopInput``."""
     return TeleopInput(
-        forward=bool(keys[pygame.K_w]),
-        backward=bool(keys[pygame.K_s]),
-        yaw_left=bool(keys[pygame.K_a]),
-        yaw_right=bool(keys[pygame.K_d]),
-        pan_left=bool(keys[pygame.K_LEFT]),
-        pan_right=bool(keys[pygame.K_RIGHT]),
-        tilt_up=bool(keys[pygame.K_UP]),
-        tilt_down=bool(keys[pygame.K_DOWN]),
-        boost=bool(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]),
-        reset=reset_pressed,
+        forward=state.forward,
+        backward=state.backward,
+        yaw_left=state.yaw_left,
+        yaw_right=state.yaw_right,
+        pan_left=state.pan_left,
+        pan_right=state.pan_right,
+        tilt_up=state.tilt_up,
+        tilt_down=state.tilt_down,
+        boost=state.boost,
+        reset=state.reset_pressed,
     )
 
 
@@ -177,24 +176,23 @@ def main() -> None:
         left_hw=LIVE_HW, right_hw=LIVE_HW, title="mumt M2a - teleop spot 0"
     )
 
-    running = True
     try:
-        while running:
-            dt = window.tick(TARGET_FPS)
+        # Prime the window with one frame BEFORE polling so cv2 has a real
+        # surface to receive focus / key events on.
+        obs = sim.get_sensor_observations([OBSERVER_AGENT_ID, SPOT_0_HEAD_AGENT_ID])
+        window.show(
+            obs[SPOT_0_HEAD_AGENT_ID][s0_rgb_uuid][:, :, :3],
+            obs[OBSERVER_AGENT_ID]["observer_rgb"][:, :, :3],
+            hud_lines=["loading..."],
+        )
 
-            reset_pressed = False
-            for event in window.poll_events():
-                if event.type == pygame.QUIT:
-                    running = False
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
-                        running = False
-                    elif event.key == pygame.K_r:
-                        reset_pressed = True
-            if not running:
+        while not window.should_close():
+            dt = window.tick(TARGET_FPS)
+            state = window.poll_input()
+            if state.quit_pressed:
                 break
 
-            controls = _build_input(window.keys_pressed(), reset_pressed)
+            controls = _build_input(state)
             teleop.step(dt, controls)
 
             obs = sim.get_sensor_observations(
@@ -209,8 +207,7 @@ def main() -> None:
                 f"yaw {math.degrees(teleop.state.yaw):+6.1f} deg   "
                 f"pan {math.degrees(teleop.state.pan):+6.1f} deg   "
                 f"tilt {math.degrees(teleop.state.tilt):+6.1f} deg",
-                f"{1.0/dt:5.1f} fps   "
-                f"{'BOOST' if controls.boost else '     '}",
+                f"{1.0/dt:5.1f} fps   {'BOOST' if controls.boost else '     '}",
             ]
             window.show(left, right, hud_lines=hud)
     finally:

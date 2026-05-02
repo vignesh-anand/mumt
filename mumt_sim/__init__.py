@@ -9,7 +9,7 @@ from mumt_sim.agents import (
     add_kinematic_humanoid,
     add_kinematic_spot,
 )
-from mumt_sim.display import SplitScreenWindow
+from mumt_sim.display import InputState, SplitScreenWindow
 from mumt_sim.pan_tilt import HeadState, PanTiltHead
 from mumt_sim.scene import make_sim
 from mumt_sim.spawn import (
@@ -24,6 +24,7 @@ __all__ = [
     "SPOT_HEAD_OFFSET",
     "SPOT_STANDING",
     "HeadState",
+    "InputState",
     "PanTiltHead",
     "SplitScreenWindow",
     "SpotTeleop",
