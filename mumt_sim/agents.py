@@ -23,6 +23,13 @@ import magnum as mn
 SPOT_URDF: str = "data/robots/hab_spot_arm/urdf/hab_spot_arm.urdf"
 HUMAN_URDF_TEMPLATE: str = "data/humanoids/humanoid_data/{name}/{name}.urdf"
 
+# habitat-lab's KinematicHumanoid stores yaw as ``user_yaw + pi/2`` because the
+# SMPL-X URDF's natural forward axis is +Z, while our ``yaw=0`` convention
+# (matching the Spot URDF) has body forward along +X. We replicate that offset
+# inside ``add_kinematic_humanoid`` so callers can pass the same yaw they'd
+# pass to ``add_kinematic_spot``.
+_HUMAN_FORWARD_YAW_OFFSET: float = 1.5707963267948966  # math.pi / 2
+
 # Standing pose joint values, ordered as the URDF declares them:
 #   indices 0..6  : arm
 #   index   7     : gripper
@@ -113,12 +120,18 @@ def add_kinematic_humanoid(
     name: str = "female_0",
     urdf_template: str = HUMAN_URDF_TEMPLATE,
 ):
-    """Drop a kinematic humanoid mannequin (T-pose) at ``position``."""
+    """Drop a kinematic humanoid mannequin (T-pose) at ``position``.
+
+    ``yaw_rad`` follows the same convention as ``add_kinematic_spot`` (yaw=0
+    means body forward along world +X). The SMPL-X URDF's natural forward is
+    +Z, so we add a fixed offset under the hood; see
+    ``_HUMAN_FORWARD_YAW_OFFSET``.
+    """
     return _add_kinematic_articulated(
         sim,
         urdf_path=urdf_template.format(name=name),
         position=position,
-        yaw_rad=yaw_rad,
+        yaw_rad=yaw_rad + _HUMAN_FORWARD_YAW_OFFSET,
         joint_positions=None,
         fixed_base=True,
     )
