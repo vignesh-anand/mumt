@@ -175,6 +175,10 @@ window once after it appears so it has keyboard focus. Controls:
 | `R`            | reset Spot 0 to start pose, zero pan/tilt             |
 | `Esc` / close  | quit                                                  |
 
+Note: keys are captured globally via ``pynput`` for accurate held-key state,
+so the cv2 window does NOT need keyboard focus, but typing in another app
+(Slack, terminal, editor) will also drive Spot. Quit before doing that.
+
 **Conventions established here:**
 
 - Teleop modules are framework-agnostic. Drivers fill a
@@ -188,8 +192,9 @@ window once after it appears so it has keyboard focus. Controls:
 - Body XZ motion gets clamped against walls via ``pathfinder.try_step`` (sliding
   contact). Yaw, pan, and tilt are unconstrained except for tilt's hard plus-or-minus
   60 deg clamp inside ``mumt_sim/teleop.py``.
-- Live windowing uses **OpenCV**, not pygame (see problem below). cv2 keys are
-  emulated as held via a 120 ms last-seen window in ``SplitScreenWindow.poll_input``.
+- Live windowing uses **OpenCV** for display + **pynput** for input (see
+  problems below). pynput hooks real X11 KeyPress/KeyRelease events in a
+  background thread, so 'is W held' is precise instead of an auto-repeat guess.
 
 **Problems hit and how we solved them:**
 
@@ -200,12 +205,16 @@ window once after it appears so it has keyboard focus. Controls:
   -> dropped pygame entirely; ``mumt_sim/display.py`` now uses
      ``cv2.imshow`` + ``cv2.waitKeyEx``. cv2's GTK/Qt window has no GL state of
      its own so habitat-sim keeps its context.
-- cv2 has no native held-key state (only one-shot ``waitKey`` events)
-  -> emulate held-state via a per-keycode last-seen timestamp + 120 ms hold
-     window in ``SplitScreenWindow.poll_input``. Linux key auto-repeat keeps
-     the timestamp fresh while the key is physically down. Initial press has a
-     ~250 ms OS-level delay; that's a known limitation, swap in ``pynput`` for
-     a proper global listener if it bites in M2b/c.
+- cv2 has no native held-key state (only one-shot ``waitKey`` events). First
+  attempt: emulate via a 120 ms last-seen window over keycodes. Felt visibly
+  laggy because Linux's keyboard auto-repeat doesn't start until ~250 ms after
+  press, so every fresh keystroke had a dead-zone between the initial press
+  and the first auto-repeat
+  -> swapped to ``pynput.keyboard.Listener`` running in a daemon thread; it
+     reports real KeyPress / KeyRelease events at the X11 layer, no
+     auto-repeat dependency. Implementation in ``mumt_sim/display._PynputTracker``.
+     Caveat: pynput captures globally, so don't type elsewhere while teleop
+     is open. Wayland-only (no Xwayland) sessions will see no keys.
 - ``Quaternion.angle()`` always returns [0, pi] so reading initial yaw from the
   Spot AO loses sign
   -> reconstruct sign from ``rotation.axis().y`` in ``SpotTeleop.__init__``.
