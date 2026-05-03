@@ -5,3 +5,5 @@ hydra-core
 omegaconf
 opencv-python>=4.8
 pynput>=1.7
+google-genai>=0.3
+

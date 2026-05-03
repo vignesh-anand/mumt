@@ -42,6 +42,7 @@ import math
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 faulthandler.enable()
 
@@ -64,6 +65,8 @@ cv2.waitKey(1)
 import habitat_sim
 
 from mumt_sim.agent.coverage import CoverageMap, CoverageMapConfig
+from mumt_sim.agent.memory import MemoryTable, default_jsonl_path
+from mumt_sim.agent.perception import CaptionWorker, GemmaClient
 from mumt_sim.agents import add_kinematic_humanoid, add_kinematic_spot
 from mumt_sim.display import InputState, MultiPaneWindow
 from mumt_sim.pan_tilt import PanTiltHead
@@ -261,6 +264,35 @@ def main() -> None:
         flush=True,
     )
 
+    # ----- Gemma 4 caption workers -------------------------------------
+    # One per Spot, 2 Hz. Workers snapshot the latest head-cam RGB,
+    # caption it, and append a row to ``memory``. If the Gemini API
+    # key is missing we silently skip captioning so the rest of the
+    # rig keeps working.
+    memory_path = default_jsonl_path()
+    memory = MemoryTable(jsonl_path=memory_path)
+    print(f"==> memory table -> {memory_path}", flush=True)
+    caption_workers: list[Optional[CaptionWorker]] = [None, None]
+    try:
+        gemma_client = GemmaClient(
+            model=os.environ.get("MUMT_GEMMA_MODEL", "gemma-4-26b-a4b-it"),
+        )
+        for spot_id in (0, 1):
+            worker = CaptionWorker(
+                spot_id=spot_id, client=gemma_client, memory=memory,
+                period_s=2.0,
+            )
+            worker.start()
+            caption_workers[spot_id] = worker
+        print(f"==> Gemma caption workers running (model={gemma_client.model})",
+              flush=True)
+    except Exception as exc:
+        print(
+            f"==> WARNING: Gemma captioning disabled ({exc}). "
+            f"Set GEMINI_API_KEY to enable.",
+            flush=True,
+        )
+
     print("==> opening teleop window. WASD drives Spot 0, arrows drive Spot 1.",
           flush=True)
     window = MultiPaneWindow(
@@ -338,6 +370,23 @@ def main() -> None:
             spot0_frame = obs[SPOT_0_HEAD_AGENT_ID][s0_rgb_uuid][:, :, :3]
             spot1_frame = obs[SPOT_1_HEAD_AGENT_ID][s1_rgb_uuid][:, :, :3]
 
+            # Hand the latest head-cam frame + sector to each caption
+            # worker. Cheap (just stores a reference under a lock); the
+            # worker picks it up next time its 2 s tick fires.
+            for spot_id, frame in ((0, spot0_frame), (1, spot1_frame)):
+                worker = caption_workers[spot_id]
+                if worker is None:
+                    continue
+                body_pos = spot_bodies[spot_id].translation
+                sector = coverage.coarse_label_for_world_xz(
+                    float(body_pos.x), float(body_pos.z),
+                )
+                # habitat-sim returns RGB; flag rgb_is_bgr=False so the
+                # JPEG encoder swaps channels for cv2.
+                worker.post_observation(
+                    rgb=frame, t_sim=sim_t, sector=sector, rgb_is_bgr=False,
+                )
+
             # Coverage update: per-Spot depth back-projection + self-cell stamp.
             cells_stamped = [0, 0]
             for spot_id in (0, 1):
@@ -366,11 +415,27 @@ def main() -> None:
             huds = []
             for i, t in enumerate(teleops):
                 pos = t.state.position
-                huds.append([
+                hud = [
                     label_for_spot[i],
                     f"pos ({pos.x:+.2f}, {pos.y:+.2f}, {pos.z:+.2f}) m",
                     f"yaw {math.degrees(t.state.yaw):+6.1f} deg",
-                ])
+                ]
+                latest = memory.latest_for_spot(i)
+                if latest is not None:
+                    age = max(0.0, sim_t - latest.t_sim)
+                    objs_str = ", ".join(latest.objects[:5]) if latest.objects else "-"
+                    scene = latest.scene_description.strip() or "-"
+                    if len(scene) > 64:
+                        scene = scene[:61] + "..."
+                    hud.append(
+                        f"room {latest.room_name}  sect {latest.sector or '--'}  "
+                        f"({age:4.1f}s ago)"
+                    )
+                    hud.append(f"objs: {objs_str}")
+                    hud.append(f"scene: {scene}")
+                else:
+                    hud.append("gemma: (no caption yet)")
+                huds.append(hud)
             huds[0].append(f"{1.0/dt:5.1f} fps   {'BOOST' if state.boost else '     '}")
 
             cov_seen_total = int((coverage.last_seen_t.max(axis=-1) > -1e8).sum())
@@ -390,6 +455,7 @@ def main() -> None:
                 f"seen {cov_seen_total}/{cov_navigable} cells ({cov_pct:4.1f}%)",
                 f"s0 sector {label_s0}   s1 sector {label_s1}",
                 f"stamped this tick: spot0={cells_stamped[0]}  spot1={cells_stamped[1]}",
+                f"memory rows: {len(memory)}",
             ]
 
             window.show([
@@ -398,6 +464,10 @@ def main() -> None:
                 (coverage_img, cov_hud, True),
             ])
     finally:
+        for worker in caption_workers:
+            if worker is not None:
+                worker.stop(timeout=2.0)
+        memory.close()
         window.close()
         sim.close()
 
