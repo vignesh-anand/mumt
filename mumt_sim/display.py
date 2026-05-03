@@ -54,8 +54,9 @@ class InputState:
     tilt_up: bool = False
     tilt_down: bool = False
     boost: bool = False
-    reset_pressed: bool = False  # edge-triggered (rising edge of R)
-    quit_pressed: bool = False   # Esc edge or window close
+    reset_pressed: bool = False         # edge-triggered (rising edge of R)
+    switch_active_pressed: bool = False  # edge-triggered (rising edge of Tab)
+    quit_pressed: bool = False          # Esc edge or window close
 
 
 class _PynputTracker:
@@ -70,6 +71,7 @@ class _PynputTracker:
         self._lock = threading.Lock()
         self._held: set[str] = set()
         self._reset_edge = False
+        self._switch_edge = False
         self._quit_edge = False
         self._listener = keyboard.Listener(
             on_press=self._on_press, on_release=self._on_release
@@ -98,6 +100,8 @@ class _PynputTracker:
             return "right"
         if key in (keyboard.Key.shift, keyboard.Key.shift_r):
             return "shift"
+        if key == keyboard.Key.tab:
+            return "tab"
         if key == keyboard.Key.esc:
             return "esc"
         return None
@@ -112,6 +116,8 @@ class _PynputTracker:
                 return
             if name == "r" and "r" not in self._held:
                 self._reset_edge = True
+            if name == "tab" and "tab" not in self._held:
+                self._switch_edge = True
             self._held.add(name)
 
     def _on_release(self, key) -> None:
@@ -121,15 +127,17 @@ class _PynputTracker:
         with self._lock:
             self._held.discard(name)
 
-    def snapshot(self) -> tuple[set[str], bool, bool]:
-        """Return (held_keys_copy, reset_edge, quit_edge), clearing edges."""
+    def snapshot(self) -> tuple[set[str], bool, bool, bool]:
+        """Return (held_keys_copy, reset_edge, switch_edge, quit_edge), clearing edges."""
         with self._lock:
             held = set(self._held)
             reset_edge = self._reset_edge
+            switch_edge = self._switch_edge
             quit_edge = self._quit_edge
             self._reset_edge = False
+            self._switch_edge = False
             self._quit_edge = False
-        return held, reset_edge, quit_edge
+        return held, reset_edge, switch_edge, quit_edge
 
     def stop(self) -> None:
         try:
@@ -228,7 +236,7 @@ class SplitScreenWindow:
         if visible < 1.0:
             self._closed = True
 
-        held, reset_edge, quit_edge = self._tracker.snapshot()
+        held, reset_edge, switch_edge, quit_edge = self._tracker.snapshot()
         if quit_edge:
             self._closed = True
 
@@ -243,6 +251,7 @@ class SplitScreenWindow:
             tilt_down="down" in held,
             boost="shift" in held,
             reset_pressed=reset_edge,
+            switch_active_pressed=switch_edge,
             quit_pressed=self._closed,
         )
 
@@ -256,3 +265,205 @@ class SplitScreenWindow:
         except cv2.error:
             pass
         cv2.waitKey(1)
+
+
+class MultiPaneWindow:
+    """Grid-laid-out cv2 window + pynput-driven keyboard input.
+
+    Generalisation of ``SplitScreenWindow`` for the autonomy harness. The
+    constructor takes a row-major list of pane sizes; each row's height is
+    the max of its panes' heights, and the canvas width is the max of any
+    row's summed widths. Panes are indexed in row-major order (left-to-right,
+    top-to-bottom) and ``show`` takes a flat list aligned with that order.
+
+    Example: 3-pane layout with two head views on top and one wide coverage
+    pane below:
+
+    >>> win = MultiPaneWindow(pane_grid=[
+    ...     [(360, 480), (360, 480)],   # top row: Spot 0 head | Spot 1 head
+    ...     [(360, 960)],               # bottom row: coverage map
+    ... ])
+    >>> while not win.should_close():
+    ...     dt = win.tick(60)
+    ...     state = win.poll_input()
+    ...     win.show([spot0, spot1, cov])
+    """
+
+    def __init__(
+        self,
+        pane_grid,
+        title: str = "mumt",
+    ) -> None:
+        self.title = title
+        self.pane_grid = [[(int(h), int(w)) for (h, w) in row] for row in pane_grid]
+        if not self.pane_grid or not any(self.pane_grid):
+            raise ValueError("pane_grid must contain at least one row with one pane")
+
+        self._pane_placements: list[tuple[int, int, int, int]] = []  # (y, x, h, w)
+        y = 0
+        max_w = 0
+        for row in self.pane_grid:
+            if not row:
+                raise ValueError("pane_grid rows must not be empty")
+            row_max_h = max(h for (h, _) in row)
+            x = 0
+            for (h, w) in row:
+                self._pane_placements.append((y, x, h, w))
+                x += w
+            max_w = max(max_w, x)
+            y += row_max_h
+        self._canvas_h = y
+        self._canvas_w = max_w
+
+        cv2.namedWindow(self.title, cv2.WINDOW_AUTOSIZE)
+
+        self._tracker = _PynputTracker()
+        self._closed = False
+        self._last_tick = time.monotonic()
+
+    @staticmethod
+    def _to_bgr(img: np.ndarray) -> np.ndarray:
+        """Accept RGB / RGBA / BGR uint8 and return BGR uint8 contiguous."""
+        if img.ndim == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.ndim == 3 and img.shape[2] == 4:
+            img = img[:, :, :3]
+            return cv2.cvtColor(np.ascontiguousarray(img), cv2.COLOR_RGB2BGR)
+        if img.ndim == 3 and img.shape[2] == 3:
+            # Heuristic: caller is responsible for telling us whether they
+            # passed RGB or BGR. We treat 3-channel as RGB by default to match
+            # SplitScreenWindow's contract (habitat-sim hands us RGB), and
+            # downstream callers that already have BGR can just call
+            # cv2.cvtColor(..., COLOR_BGR2RGB) before passing in - or we add a
+            # convention if it gets noisy. For coverage map (which we draw in
+            # BGR ourselves) we expose ``show_bgr`` below.
+            return cv2.cvtColor(np.ascontiguousarray(img), cv2.COLOR_RGB2BGR)
+        raise ValueError(f"unsupported image shape {img.shape}")
+
+    @staticmethod
+    def _draw_hud_at(canvas: np.ndarray, x: int, y0: int, lines) -> None:
+        if not lines:
+            return
+        y = y0 + 18
+        for line in lines:
+            cv2.putText(canvas, line, (x + 8, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(canvas, line, (x + 8, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            y += 18
+
+    def show(
+        self,
+        panes,
+        active_pane: Optional[int] = None,
+        active_color_bgr=(0, 255, 0),
+    ) -> None:
+        """Composite + display.
+
+        ``panes`` is a flat list aligned with the row-major pane order. Each
+        entry is either:
+          - a numpy image (RGB / RGBA / BGR-3ch / GRAY), or
+          - a tuple ``(image, hud_lines, is_bgr=False)``.
+        """
+        if len(panes) != len(self._pane_placements):
+            raise ValueError(
+                f"expected {len(self._pane_placements)} panes, got {len(panes)}"
+            )
+        canvas = np.zeros((self._canvas_h, self._canvas_w, 3), dtype=np.uint8)
+        for i, ((y, x, h, w), entry) in enumerate(zip(self._pane_placements, panes)):
+            img = entry
+            hud = None
+            is_bgr = False
+            if isinstance(entry, tuple):
+                if len(entry) == 2:
+                    img, hud = entry
+                elif len(entry) == 3:
+                    img, hud, is_bgr = entry
+                else:
+                    raise ValueError(f"pane {i}: tuple must be (img, hud[, is_bgr])")
+
+            if is_bgr:
+                if img.ndim == 2:
+                    img_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                elif img.ndim == 3 and img.shape[2] == 4:
+                    img_bgr = cv2.cvtColor(np.ascontiguousarray(img[:, :, :3]),
+                                            cv2.COLOR_RGBA2BGR)
+                else:
+                    img_bgr = np.ascontiguousarray(img)
+            else:
+                img_bgr = self._to_bgr(img)
+
+            ih, iw = img_bgr.shape[:2]
+            if (ih, iw) != (h, w):
+                img_bgr = cv2.resize(img_bgr, (w, h), interpolation=cv2.INTER_AREA)
+            canvas[y:y + h, x:x + w] = img_bgr
+
+            if active_pane == i:
+                cv2.rectangle(canvas, (x + 1, y + 1), (x + w - 2, y + h - 2),
+                              active_color_bgr, 2)
+
+            self._draw_hud_at(canvas, x, y, hud)
+
+        cv2.imshow(self.title, canvas)
+
+    def tick(self, target_fps: int = 60) -> float:
+        target_dt = 1.0 / max(1, target_fps)
+        now = time.monotonic()
+        elapsed = now - self._last_tick
+        sleep_ms = max(1, int(round((target_dt - elapsed) * 1000.0)))
+        cv2.waitKey(sleep_ms)
+        new_now = time.monotonic()
+        dt = new_now - self._last_tick
+        self._last_tick = new_now
+        return dt
+
+    def poll_input(self) -> InputState:
+        try:
+            visible = cv2.getWindowProperty(self.title, cv2.WND_PROP_VISIBLE)
+        except cv2.error:
+            visible = 0.0
+        if visible < 1.0:
+            self._closed = True
+
+        held, reset_edge, switch_edge, quit_edge = self._tracker.snapshot()
+        if quit_edge:
+            self._closed = True
+
+        return InputState(
+            forward="w" in held,
+            backward="s" in held,
+            yaw_left="a" in held,
+            yaw_right="d" in held,
+            pan_left="left" in held,
+            pan_right="right" in held,
+            tilt_up="up" in held,
+            tilt_down="down" in held,
+            boost="shift" in held,
+            reset_pressed=reset_edge,
+            switch_active_pressed=switch_edge,
+            quit_pressed=self._closed,
+        )
+
+    def should_close(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        self._tracker.stop()
+        try:
+            cv2.destroyWindow(self.title)
+        except cv2.error:
+            pass
+        cv2.waitKey(1)
+
+
+def make_placeholder_pane(hw, label: str) -> np.ndarray:
+    """Build a dark grey BGR pane with centered text. Used while a real
+    pane (e.g. the coverage map) hasn't been wired yet."""
+    h, w = int(hw[0]), int(hw[1])
+    img = np.full((h, w, 3), 32, dtype=np.uint8)
+    text_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+    tx = max(0, (w - text_size[0]) // 2)
+    ty = max(0, (h + text_size[1]) // 2)
+    cv2.putText(img, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (200, 200, 200), 2, cv2.LINE_AA)
+    return img

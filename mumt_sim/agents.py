@@ -43,9 +43,23 @@ _SPOT_LEG_INIT: tuple[float, ...] = (0.0, 0.7, -1.5) * 4
 SPOT_STANDING: tuple[float, ...] = _SPOT_ARM_INIT + _SPOT_GRIP_INIT + _SPOT_LEG_INIT
 assert len(SPOT_STANDING) == 20
 
-# Head camera offset in Spot's body frame, taken from
-# ``SpotRobot._get_spot_params().cameras["articulated_agent_head_*"].cam_offset_pos``.
-SPOT_HEAD_OFFSET: mn.Vector3 = mn.Vector3(0.479, 0.5, 0.0)
+# Head camera offset in Spot's body frame.
+#
+# habitat-lab's stock value (``SpotRobot._get_spot_params().cameras
+# ["articulated_agent_head_*"].cam_offset_pos``) is ``(0.479, 0.5, 0.0)``: the
+# head juts ~48 cm forward of the body origin. That's anatomically correct for
+# a real Spot (long neck + short body), but in our setup it's larger than the
+# navmesh ``agent_radius`` we use for collision-aware teleop, which means the
+# head camera can poke through thin walls and produce phantom coverage on the
+# far side.
+#
+# We shrink the forward offset to 20 cm so that, paired with our project's
+# navmesh ``agent_radius == 0.30`` (the habitat default; see
+# ``scripts/teleop_two_spots_with_coverage.py`` and friends), the head sits
+# ~10 cm inside the body's wall-clearance disk instead of poking past it.
+# This trade keeps doorway navigation unrestricted (60 cm passages still fit)
+# at the cost of the head being a bit closer to the body than on a real Spot.
+SPOT_HEAD_OFFSET: mn.Vector3 = mn.Vector3(0.20, 0.5, 0.0)
 
 
 def _yaw_quat(yaw_rad: float) -> mn.Quaternion:

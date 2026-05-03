@@ -160,6 +160,127 @@ def find_open_spawn_spot(
     return best_pt, best_clear
 
 
+def _geodesic_distance(pathfinder, a, b) -> float:
+    """Shortest-path distance along the navmesh between ``a`` and ``b``.
+
+    Returns ``+inf`` if no path exists (e.g. the points are in disconnected
+    navmesh islands). Both endpoints must already be on the navmesh.
+    """
+    import habitat_sim
+
+    path = habitat_sim.ShortestPath()
+    path.requested_start = np.asarray(a, dtype=np.float32)
+    path.requested_end = np.asarray(b, dtype=np.float32)
+    if not pathfinder.find_path(path):
+        return float("inf")
+    return float(path.geodesic_distance)
+
+
+def sample_far_pair_navmesh(
+    pathfinder,
+    n_samples: int = 600,
+    min_clearance: float = 0.7,
+    refine_iters: int = 3,
+) -> Tuple[Sequence[float], Sequence[float], float]:
+    """Find a pair of navigable points that are far apart *along the navmesh*.
+
+    Picks an anchor as the highest-clearance point in a random sample, then
+    iteratively re-anchors on the partner with the longest geodesic distance
+    from the current anchor (a couple of iterations of the standard
+    "double-sweep" diameter approximation on the navmesh graph). All
+    candidates are filtered by ``min_clearance`` so neither spot ends up
+    pressed against a wall.
+
+    Returns ``(point_a, point_b, geodesic_distance_m)``.
+
+    Raises RuntimeError if fewer than two candidates pass the clearance
+    filter, or if no pair is path-connected on the navmesh.
+    """
+    if not pathfinder.is_loaded:
+        raise RuntimeError("pathfinder.is_loaded == False")
+
+    candidates: List[np.ndarray] = []
+    for _ in range(n_samples):
+        p = pathfinder.get_random_navigable_point()
+        if not np.all(np.isfinite(p)):
+            continue
+        if float(pathfinder.distance_to_closest_obstacle(p)) < min_clearance:
+            continue
+        candidates.append(np.asarray(p, dtype=np.float32))
+
+    if len(candidates) < 2:
+        raise RuntimeError(
+            f"Only {len(candidates)} navmesh samples passed clearance "
+            f">= {min_clearance} m (out of {n_samples}); cannot pick a pair."
+        )
+
+    cands_arr = np.stack(candidates, axis=0)
+
+    clearances = np.array(
+        [float(pathfinder.distance_to_closest_obstacle(p)) for p in cands_arr]
+    )
+    anchor_idx = int(np.argmax(clearances))
+    anchor = cands_arr[anchor_idx]
+
+    partner = anchor
+    best_d = 0.0
+    for _ in range(max(1, refine_iters)):
+        ds = np.array(
+            [_geodesic_distance(pathfinder, anchor, c) for c in cands_arr]
+        )
+        ds[~np.isfinite(ds)] = -1.0
+        partner_idx = int(np.argmax(ds))
+        new_d = float(ds[partner_idx])
+        if new_d <= best_d:
+            break
+        partner = cands_arr[partner_idx]
+        best_d = new_d
+        anchor, partner = partner, anchor
+
+    if best_d <= 0.0:
+        raise RuntimeError(
+            "Could not find any pair of navigable points connected by a "
+            "navmesh path. Scene navmesh may be entirely disconnected."
+        )
+
+    return anchor.tolist(), partner.tolist(), best_d
+
+
+def navmesh_path_midpoint(
+    pathfinder, a: Sequence[float], b: Sequence[float]
+) -> Sequence[float]:
+    """Point on the shortest navmesh path from ``a`` to ``b`` closest to the
+    halfway mark by arc length. Returns a 3-vector snapped to the navmesh.
+
+    Falls back to ``snap_point((a+b)/2)`` if the shortest path has no
+    intermediate waypoints (e.g. very short paths).
+    """
+    import habitat_sim
+
+    path = habitat_sim.ShortestPath()
+    path.requested_start = np.asarray(a, dtype=np.float32)
+    path.requested_end = np.asarray(b, dtype=np.float32)
+    if not pathfinder.find_path(path) or len(path.points) < 2:
+        mid = (np.asarray(a, dtype=np.float32) + np.asarray(b, dtype=np.float32)) / 2.0
+        return np.asarray(pathfinder.snap_point(mid)).tolist()
+
+    pts = [np.asarray(p, dtype=np.float32) for p in path.points]
+    seg_lens = [float(np.linalg.norm(pts[i + 1] - pts[i])) for i in range(len(pts) - 1)]
+    total = sum(seg_lens)
+    if total <= 1e-6:
+        return np.asarray(pts[0]).tolist()
+
+    target = total / 2.0
+    travelled = 0.0
+    for i, L in enumerate(seg_lens):
+        if travelled + L >= target:
+            t = (target - travelled) / max(L, 1e-6)
+            mid = pts[i] + t * (pts[i + 1] - pts[i])
+            return np.asarray(pathfinder.snap_point(mid)).tolist()
+        travelled += L
+    return np.asarray(pts[-1]).tolist()
+
+
 def equilateral_triangle_around(
     center: Sequence[float],
     radius: float,
