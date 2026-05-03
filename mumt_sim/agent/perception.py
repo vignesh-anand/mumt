@@ -313,7 +313,7 @@ class OnDemandCaptioner:
     def __init__(
         self,
         client: GemmaClient,
-        max_workers: int = 2,
+        max_workers: int = 6,
         name: str = "OnDemandCaptioner",
     ) -> None:
         self.client = client

@@ -181,13 +181,13 @@ def plan_search_tour(
     coverage,
     sector_label: str,
     *,
-    n_positions: int = 100,
+    n_positions: int = 40,
     n_headings: int = 12,
     k_max: int = 6,
     min_gain_cells: int = 10,
     hfov_rad: float = math.radians(70.0),
     max_range_m: float = 5.0,
-    n_los_rays: int = 360,
+    n_los_rays: int = 180,
     rng: Optional[np.random.Generator] = None,
 ) -> list[Viewpoint]:
     """Random-sample greedy set-cover viewpoint planner.

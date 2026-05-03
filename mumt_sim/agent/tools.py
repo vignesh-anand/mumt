@@ -41,6 +41,8 @@ import habitat_sim
 
 from mumt_sim.teleop import SpotTeleop
 
+import itertools
+
 from .coverage import CoverageMap
 from .perception import (
     SEARCH_VIEWPOINT_PROMPT,
@@ -49,6 +51,57 @@ from .perception import (
     parse_search_caption,
 )
 from .visibility import Viewpoint, plan_search_tour
+
+
+def _order_tour_by_travel(
+    start_xz: tuple[float, float],
+    tour: list[Viewpoint],
+    exact_max_k: int = 8,
+) -> list[Viewpoint]:
+    """Reorder ``tour`` to minimise total Euclidean travel from
+    ``start_xz``, visiting each viewpoint exactly once.
+
+    For ``len(tour) <= exact_max_k`` we brute-force every permutation
+    (8! = 40320 paths, each scored in O(K) on tiny floats -- well
+    under a millisecond). For larger K we fall back to nearest-
+    neighbour greedy. Euclidean distance ignores walls, but for a
+    5 m sector + 8 neighbours that's almost always fine; we can swap
+    in geodesic distances later if needed.
+    """
+    n = len(tour)
+    if n <= 1:
+        return list(tour)
+
+    coords = np.array([(vp.x, vp.z) for vp in tour], dtype=np.float64)
+    start = np.array(start_xz, dtype=np.float64)
+
+    def total_cost(perm: tuple[int, ...]) -> float:
+        prev = start
+        cost = 0.0
+        for i in perm:
+            cur = coords[i]
+            cost += float(np.linalg.norm(cur - prev))
+            prev = cur
+        return cost
+
+    if n <= exact_max_k:
+        best_perm = min(
+            itertools.permutations(range(n)), key=total_cost
+        )
+        return [tour[i] for i in best_perm]
+
+    # NN heuristic for K > exact_max_k.
+    remaining = list(range(n))
+    perm: list[int] = []
+    cur = start
+    while remaining:
+        nxt = min(
+            remaining, key=lambda i: float(np.linalg.norm(coords[i] - cur))
+        )
+        perm.append(nxt)
+        cur = coords[nxt]
+        remaining.remove(nxt)
+    return [tour[i] for i in perm]
 
 
 PrimitiveStatus = Literal[
@@ -592,13 +645,13 @@ class SearchSectorConfig:
     """Tunable knobs for :class:`SearchSectorController`. Defaults
     match the agreed plan."""
 
-    n_positions: int = 100
+    n_positions: int = 40
     n_headings: int = 12
     k_max: int = 6
     min_gain_cells: int = 10
     hfov_rad: float = math.radians(70.0)
     max_range_m: float = 5.0
-    n_los_rays: int = 360
+    n_los_rays: int = 180
     plan_timeout_s: float = 10.0
     """Cap on the background plan_search_tour call. The default
     n_positions=100 typically completes in ~3 s."""
@@ -647,7 +700,7 @@ class SearchSectorController(Controller):
     name = "search"
 
     _Phase = Literal[
-        "init", "planning", "goto", "face", "settle", "caption", "wait", "done"
+        "init", "planning", "goto", "face", "settle", "submit", "drain", "done"
     ]
 
     def __init__(
@@ -657,7 +710,7 @@ class SearchSectorController(Controller):
         cfg: Optional[SearchSectorConfig] = None,
     ) -> None:
         super().__init__(
-            timeout_s=(cfg.overall_timeout_s if cfg else 180.0)
+            timeout_s=(cfg.overall_timeout_s if cfg else 240.0)
         )
         self.sector = str(sector)
         self.on_demand = on_demand
@@ -666,7 +719,6 @@ class SearchSectorController(Controller):
         self._phase: SearchSectorController._Phase = "init"
         self._tour: list[Viewpoint] = []
         self._idx: int = 0
-        self._observations: list[SearchObservation] = []
         # Background plan_search_tour future and its private executor.
         self._plan_executor: Optional[_cf.ThreadPoolExecutor] = None
         self._plan_future: Optional[_cf.Future] = None
@@ -675,11 +727,16 @@ class SearchSectorController(Controller):
         self._goto: Optional[GotoController] = None
         self._face: Optional[MoveController] = None
         self._settle_t0: float = 0.0
-        # Caption phase.
-        self._caption_future: Optional[_cf.Future] = None
-        self._caption_t0: float = 0.0
-        # Path log per viewpoint, for debugging.
-        self._reached_pose: Optional[tuple[float, float, float]] = None
+        # Pipelined captions: per-viewpoint snapshots + futures + arrival
+        # poses. _pending maps vp_idx -> (future, submit_monotonic_t) for
+        # captions that have been submitted but not yet collected.
+        # _observations_by_idx accumulates SearchObservations as futures
+        # resolve (or skip on goto failure); we flatten into a tour-order
+        # list at finish.
+        self._pending: dict[int, tuple[_cf.Future, float]] = {}
+        self._observations_by_idx: dict[int, SearchObservation] = {}
+        self._reached_poses: list[Optional[tuple[float, float, float]]] = []
+        self._drain_t0: float = 0.0
 
     # ----- Controller lifecycle -------------------------------------------
 
@@ -689,12 +746,18 @@ class SearchSectorController(Controller):
         if self._phase == "planning":
             elapsed = time.monotonic() - self._plan_t0
             return f"SEARCH {self.sector} planning ({elapsed:4.1f}s)"
+        if self._phase == "drain":
+            return (
+                f"SEARCH {self.sector} drain {len(self._pending)} "
+                f"pending caption(s) t={self._elapsed():4.1f}s"
+            )
         if self._phase == "done":
-            return f"SEARCH {self.sector} done ({len(self._observations)} obs)"
-        # k of K
+            return f"SEARCH {self.sector} done ({len(self._observations_by_idx)} obs)"
+        # k of K (visit phases)
         kk = f"vp {self._idx + 1}/{len(self._tour)}"
         sub = self._phase.upper()
-        return f"SEARCH {self.sector} {kk} phase={sub} t={self._elapsed():4.1f}s"
+        pending = f" pend={len(self._pending)}" if self._pending else ""
+        return f"SEARCH {self.sector} {kk} phase={sub}{pending} t={self._elapsed():4.1f}s"
 
     def _build_result(
         self,
@@ -703,6 +766,31 @@ class SearchSectorController(Controller):
         reason: str,
     ) -> SearchResult:
         ctx.teleop.drive(0.0)
+        # Cancel any leftover pending futures (best effort; running
+        # calls keep going on their worker threads). Record them as
+        # errors so the result reflects what we know now.
+        for vp_idx, (fut, t0) in list(self._pending.items()):
+            fut.cancel()
+            elapsed = time.monotonic() - t0
+            self._observations_by_idx.setdefault(
+                vp_idx,
+                SearchObservation(
+                    viewpoint=self._tour[vp_idx],
+                    reached_pose=self._reached_poses[vp_idx]
+                    if vp_idx < len(self._reached_poses) else None,
+                    caption=None,
+                    error=f"caption: cancelled after {elapsed:.1f}s "
+                          f"(primitive ended)",
+                ),
+            )
+        self._pending.clear()
+        # Flatten observations into tour visit order (NOT planner index
+        # order, since we already TSP-reordered the tour).
+        ordered = [
+            self._observations_by_idx[i]
+            for i in range(len(self._tour))
+            if i in self._observations_by_idx
+        ]
         return SearchResult(
             primitive=self.name,
             status=status,
@@ -712,7 +800,7 @@ class SearchSectorController(Controller):
             path_followed=list(self._path_followed),
             sector=self.sector,
             n_viewpoints_planned=len(self._tour),
-            observations=list(self._observations),
+            observations=ordered,
         )
 
     # ----- main step ------------------------------------------------------
@@ -734,6 +822,11 @@ class SearchSectorController(Controller):
                 f"search exceeded {self.timeout_s:.0f}s wall budget",
             )
 
+        # Drain any captions that completed while we drove. Cheap
+        # poll, runs every tick regardless of which visit phase we're
+        # in, so observations land as soon as the API responds.
+        self._collect_done_pending()
+
         # Dispatch on phase.
         if self._phase == "init":
             return self._enter_planning(ctx)
@@ -745,14 +838,15 @@ class SearchSectorController(Controller):
             return self._step_face(dt, ctx)
         if self._phase == "settle":
             return self._step_settle(ctx)
-        if self._phase == "caption":
-            return self._step_caption(ctx)
-        if self._phase == "wait":
-            return self._step_wait(ctx)
+        if self._phase == "submit":
+            return self._step_submit(ctx)
+        if self._phase == "drain":
+            return self._step_drain(ctx)
         if self._phase == "done":
+            obs_count = len(self._observations_by_idx)
             return self._build_result(
                 ctx, "success",
-                f"searched {self.sector}: {len(self._observations)} viewpoints captured",
+                f"searched {self.sector}: {obs_count}/{len(self._tour)} viewpoints captioned",
             )
         return None
 
@@ -818,8 +912,15 @@ class SearchSectorController(Controller):
                 f"plan_search_tour raised {type(exc).__name__}: {exc}",
             )
         self._cleanup_executors()
-        self._tour = list(tour)
+        # Reorder the planner's coverage-greedy output into travel-
+        # optimal order from where the spot is right now. For K <= 8
+        # this is exact (brute-force open TSP); above that we fall
+        # back to nearest-neighbour. Cuts total drive distance
+        # significantly when the planner picks viewpoints scattered
+        # around the sector edges.
+        self._tour = _order_tour_by_travel(ctx.body_xz, list(tour))
         self._idx = 0
+        self._reached_poses = [None] * len(self._tour)
         if not self._tour:
             return self._build_result(
                 ctx, "success",
@@ -830,29 +931,46 @@ class SearchSectorController(Controller):
         return None
 
     def _advance(self) -> None:
-        """Move on to the next viewpoint, or to ``done`` if exhausted."""
+        """Move on to the next viewpoint, or to the drain phase (then
+        ``done``) if all viewpoints have been visited."""
         self._idx += 1
         self._goto = None
         self._face = None
-        self._caption_future = None
-        self._reached_pose = None
         if self._idx >= len(self._tour):
-            self._phase = "done"
+            # All visits done; if we have outstanding captions, wait
+            # for them; otherwise we're already done.
+            if self._pending:
+                self._phase = "drain"
+                self._drain_t0 = time.monotonic()
+            else:
+                self._phase = "done"
         else:
             vp = self._tour[self._idx]
             self._phase = "goto"
             self._goto = GotoController((vp.x, vp.z))
 
-    def _record_failure(self, reason: str) -> None:
-        vp = self._tour[self._idx]
-        self._observations.append(
-            SearchObservation(
-                viewpoint=vp,
-                reached_pose=self._reached_pose,
-                caption=None,
-                error=reason,
-            )
+    def _record_skipped(self, reason: str) -> None:
+        """Record a failure for the CURRENT viewpoint (no Gemma call
+        was made). Distinct from caption failures recorded during
+        drain."""
+        vp_idx = self._idx
+        vp = self._tour[vp_idx]
+        self._observations_by_idx[vp_idx] = SearchObservation(
+            viewpoint=vp,
+            reached_pose=self._reached_poses[vp_idx]
+            if vp_idx < len(self._reached_poses) else None,
+            caption=None,
+            error=reason,
         )
+
+    def _set_reached_pose(self, ctx: ControllerCtx) -> None:
+        """Record the spot's current pose for the CURRENT viewpoint
+        index. Called at every motion-phase transition so we always
+        have a "best-effort arrival pose" even if a later phase
+        fails."""
+        pose = (*ctx.body_xz, ctx.yaw)
+        if self._idx < len(self._reached_poses):
+            self._reached_poses[self._idx] = pose
 
     def _step_goto(
         self, dt: float, ctx: ControllerCtx
@@ -861,9 +979,9 @@ class SearchSectorController(Controller):
         res = self._goto.step(dt, ctx)
         if res is None:
             return None
-        self._reached_pose = (*ctx.body_xz, ctx.yaw)
+        self._set_reached_pose(ctx)
         if res.status != "success":
-            self._record_failure(f"goto: {res.status} ({res.reason})")
+            self._record_skipped(f"goto: {res.status} ({res.reason})")
             self._advance()
             return None
         # Phase transition: face the planned yaw.
@@ -880,10 +998,10 @@ class SearchSectorController(Controller):
         res = self._face.step(dt, ctx)
         if res is None:
             return None
-        self._reached_pose = (*ctx.body_xz, ctx.yaw)
+        self._set_reached_pose(ctx)
         if res.status not in ("success", "timeout"):
             # Non-success but also not catastrophic: record and skip.
-            self._record_failure(f"face: {res.status} ({res.reason})")
+            self._record_skipped(f"face: {res.status} ({res.reason})")
             self._advance()
             return None
         self._settle_t0 = time.monotonic()
@@ -894,62 +1012,79 @@ class SearchSectorController(Controller):
         if (time.monotonic() - self._settle_t0) < self.cfg.settle_after_face_s:
             ctx.teleop.drive(0.0)
             return None
-        self._phase = "caption"
+        self._phase = "submit"
         return None
 
-    def _step_caption(self, ctx: ControllerCtx) -> Optional[PrimitiveResult]:
+    def _step_submit(self, ctx: ControllerCtx) -> Optional[PrimitiveResult]:
+        """Submit the caption call and IMMEDIATELY advance to the
+        next viewpoint. The future is parked in ``self._pending`` and
+        polled every tick by ``_collect_done_pending``."""
         ctx.teleop.drive(0.0)
         if ctx.latest_rgb is None:
-            self._record_failure("caption: no RGB frame available on ctx")
+            self._record_skipped("caption: no RGB frame available on ctx")
             self._advance()
             return None
-        # Hand the live frame straight to Gemma. The teleop loop allocs
-        # a fresh ndarray per tick so it's safe to reference.
-        self._caption_future = self.on_demand.submit(
+        # Hand the live frame to Gemma. We deliberately don't copy it:
+        # the teleop loop allocates a fresh ndarray each tick so the
+        # OnDemandCaptioner thread holds a Python ref that keeps the
+        # buffer alive until the JPEG encode is done.
+        future = self.on_demand.submit(
             ctx.latest_rgb,
             SEARCH_VIEWPOINT_PROMPT,
             parse_search_caption,
             rgb_is_bgr=ctx.latest_rgb_is_bgr,
         )
-        self._caption_t0 = time.monotonic()
-        self._phase = "wait"
+        self._pending[self._idx] = (future, time.monotonic())
+        self._advance()
         return None
 
-    def _step_wait(self, ctx: ControllerCtx) -> Optional[PrimitiveResult]:
+    def _collect_done_pending(self) -> None:
+        """Poll the pending-captions dict; for any future that has
+        completed, drop a SearchObservation in. Called every tick (in
+        every phase) so observations land as early as possible."""
+        if not self._pending:
+            return
+        now = time.monotonic()
+        done_idxs: list[int] = []
+        for vp_idx, (fut, t0) in self._pending.items():
+            elapsed = now - t0
+            if fut.done():
+                try:
+                    cap = fut.result()
+                    self._observations_by_idx[vp_idx] = SearchObservation(
+                        viewpoint=self._tour[vp_idx],
+                        reached_pose=self._reached_poses[vp_idx],
+                        caption=cap,
+                        error=None,
+                        t_caption_s=elapsed,
+                    )
+                except Exception as exc:
+                    self._observations_by_idx[vp_idx] = SearchObservation(
+                        viewpoint=self._tour[vp_idx],
+                        reached_pose=self._reached_poses[vp_idx],
+                        caption=None,
+                        error=f"caption: {type(exc).__name__}: {exc} "
+                              f"(after {elapsed:.1f}s)",
+                    )
+                done_idxs.append(vp_idx)
+            elif elapsed > self.cfg.caption_timeout_s:
+                fut.cancel()
+                self._observations_by_idx[vp_idx] = SearchObservation(
+                    viewpoint=self._tour[vp_idx],
+                    reached_pose=self._reached_poses[vp_idx],
+                    caption=None,
+                    error=f"caption: timeout after {elapsed:.1f}s "
+                          f"(cap={self.cfg.caption_timeout_s:.1f}s)",
+                )
+                done_idxs.append(vp_idx)
+        for vp_idx in done_idxs:
+            self._pending.pop(vp_idx, None)
+
+    def _step_drain(self, ctx: ControllerCtx) -> Optional[PrimitiveResult]:
+        """All viewpoints visited; just wait for outstanding caption
+        futures to finish (or time out). _collect_done_pending already
+        ran this tick at the top of step()."""
         ctx.teleop.drive(0.0)
-        assert self._caption_future is not None
-        elapsed = time.monotonic() - self._caption_t0
-        if elapsed > self.cfg.caption_timeout_s:
-            # Best-effort: only succeeds if the call hasn't started yet.
-            # If it has, the call keeps running on its own worker and
-            # the result is discarded when it eventually completes.
-            self._caption_future.cancel()
-            self._record_failure(
-                f"caption: timeout after {elapsed:.1f}s "
-                f"(cap={self.cfg.caption_timeout_s:.1f}s)",
-            )
-            self._advance()
-            return None
-        if not self._caption_future.done():
-            return None
-        try:
-            cap = self._caption_future.result()
-        except Exception as exc:
-            self._record_failure(
-                f"caption: {type(exc).__name__}: {exc} "
-                f"(after {elapsed:.1f}s)",
-            )
-            self._advance()
-            return None
-        vp = self._tour[self._idx]
-        self._observations.append(
-            SearchObservation(
-                viewpoint=vp,
-                reached_pose=self._reached_pose,
-                caption=cap,
-                error=None,
-                t_caption_s=time.monotonic() - self._caption_t0,
-            )
-        )
-        self._advance()
+        if not self._pending:
+            self._phase = "done"
         return None
