@@ -37,12 +37,29 @@ a follow-up if needed.
 """
 from __future__ import annotations
 
+import faulthandler
 import math
 import os
 import sys
 from pathlib import Path
 
+faulthandler.enable()
+
+import cv2
 import numpy as np
+
+# cv2/habitat_sim GLX conflict workaround: bind cv2's GTK/GLX backend to the
+# X display BEFORE importing habitat_sim. Otherwise habitat_sim's EGL/GL
+# context binds first and the next cv2.namedWindow call segfaults silently
+# on NVIDIA drivers. We start a window thread + open + paint + pump a
+# throwaway window, then destroy it; the X11/GTK side stays initialised.
+cv2.startWindowThread()
+_warmup = "_mumt_cv2_warmup"
+cv2.namedWindow(_warmup, cv2.WINDOW_NORMAL)
+cv2.imshow(_warmup, np.zeros((64, 64, 3), dtype=np.uint8))
+cv2.waitKey(1)
+cv2.destroyWindow(_warmup)
+cv2.waitKey(1)
 
 import habitat_sim
 
@@ -260,18 +277,39 @@ def main() -> None:
     input_for_spot = (_wasd_to_input, _arrows_to_input)
     label_for_spot = ("Spot 0 (WASD)", "Spot 1 (arrows)")
 
+    pane_h, pane_w = COVERAGE_PANE_HW
+
     def render_coverage_pane() -> np.ndarray:
-        img = coverage.render_topdown(
+        """Render the coverage map at fine resolution, then aspect-
+        preserving INTER_NEAREST upscale to fill the pane (letterboxed).
+        Coarse 5-m grid lines + chess labels and Spot markers are drawn
+        AFTER the upscale at the matching cell-pixel scale so they stay
+        crisp and proportional."""
+        fine = coverage.render_topdown(
             t_now=sim_t, spot_colors_bgr=SPOT_COVERAGE_BGR
         )
+        nz, nx = fine.shape[:2]
+        scale = min(pane_h / nz, pane_w / nx)
+        new_h = max(1, int(round(nz * scale)))
+        new_w = max(1, int(round(nx * scale)))
+        upscaled = cv2.resize(fine, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+        canvas = np.zeros((pane_h, pane_w, 3), dtype=np.uint8)
+        y0 = (pane_h - new_h) // 2
+        x0 = (pane_w - new_w) // 2
+        canvas[y0:y0 + new_h, x0:x0 + new_w] = upscaled
+
         spot_poses = []
         for i in (0, 1):
             p = spot_bodies[i].translation
             spot_poses.append((float(p.x), float(p.z), teleops[i].state.yaw))
+        view = canvas[y0:y0 + new_h, x0:x0 + new_w]
+        coverage.draw_coarse_grid(view, cell_pixel_scale=scale)
         coverage.draw_spot_markers(
-            img, spot_poses=spot_poses, spot_colors_bgr=SPOT_COVERAGE_BGR
+            view, spot_poses=spot_poses, spot_colors_bgr=SPOT_COVERAGE_BGR,
+            cell_pixel_scale=scale,
         )
-        return img
+        return canvas
 
     try:
         # Prime the window with one frame BEFORE polling so cv2 has a real
@@ -338,10 +376,19 @@ def main() -> None:
             cov_seen_total = int((coverage.last_seen_t.max(axis=-1) > -1e8).sum())
             cov_navigable = int(coverage.is_navigable.sum())
             cov_pct = (100.0 * cov_seen_total / max(1, cov_navigable))
+            label_s0 = coverage.coarse_label_for_world_xz(
+                float(spot_bodies[0].translation.x),
+                float(spot_bodies[0].translation.z),
+            ) or "--"
+            label_s1 = coverage.coarse_label_for_world_xz(
+                float(spot_bodies[1].translation.x),
+                float(spot_bodies[1].translation.z),
+            ) or "--"
             cov_hud = [
-                "coverage map (live)",
+                f"coverage map (live, {coverage.cfg.coarse_cell_m:g} m sectors)",
                 f"t={sim_t:6.1f}s   "
                 f"seen {cov_seen_total}/{cov_navigable} cells ({cov_pct:4.1f}%)",
+                f"s0 sector {label_s0}   s1 sector {label_s1}",
                 f"stamped this tick: spot0={cells_stamped[0]}  spot1={cells_stamped[1]}",
             ]
 

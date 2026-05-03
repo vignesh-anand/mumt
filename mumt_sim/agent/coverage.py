@@ -65,6 +65,14 @@ class CoverageMapConfig:
     At 480x640 a stride of 4 gives ~19k samples per Spot per tick which is
     well inside numpy's free budget."""
 
+    coarse_cell_m: float = 5.0
+    """Coarse-grid cell size in metres -- the agent's spatial sector
+    vocabulary. Used by ``draw_coarse_grid`` to overlay chess-style
+    grid lines and ``A1`` / ``B7`` labels on the rendered map, and by
+    ``coarse_label_for_world_xz`` to resolve a world point to its
+    sector. Independent of the fine cell size used for occupancy
+    bookkeeping."""
+
 
 def _matrix4_to_numpy(m: mn.Matrix4) -> np.ndarray:
     """Convert a magnum.Matrix4 to a numpy ``(4, 4)`` row-major float32.
@@ -415,15 +423,17 @@ class CoverageMap:
         img: np.ndarray,
         spot_poses: Sequence[tuple[float, float, float]],
         spot_colors_bgr: Sequence[tuple[int, int, int]],
-        marker_radius_cells: int = 4,
-        arrow_length_cells: int = 10,
+        marker_radius_cells: float = 4.0,
+        arrow_length_cells: float = 10.0,
+        cell_pixel_scale: float = 1.0,
     ) -> np.ndarray:
         """Draw a body-position circle + heading arrow per Spot, in-place.
 
         ``spot_poses`` is a list of ``(world_x, world_z, yaw_rad)`` tuples
-        (one per Spot). The image must be the ``(nz, nx, 3)`` BGR result of
-        ``render_topdown`` -- markers are sized in fine-cell units so they
-        scale to whatever the image gets resized to downstream.
+        (one per Spot). Pass ``cell_pixel_scale`` = (image pixels per
+        fine cell) when drawing on an upscaled render; markers and the
+        arrow stroke are sized at that scale so they stay smooth and
+        proportional.
 
         Yaw convention matches mumt_sim.teleop: yaw=0 means body forward
         along world +X, and the world-XZ forward vector is
@@ -432,25 +442,135 @@ class CoverageMap:
         """
         if len(spot_poses) != len(spot_colors_bgr):
             raise ValueError("spot_poses and spot_colors_bgr length mismatch")
+        s = float(cell_pixel_scale)
+        radius_px = max(2, int(round(marker_radius_cells * s)))
+        arrow_px = float(arrow_length_cells * s)
+        outline_thick = max(2, int(round(0.6 * s)) + 2)
+        stroke_thick = max(1, outline_thick - 1)
         out = img  # we draw in-place; cv2 funcs require contiguous BGR
         for (wx, wz, yaw), color in zip(spot_poses, spot_colors_bgr):
-            gx = int(math.floor((float(wx) - self.x_min) / self.cfg.fine_cell_m))
-            gz = int(math.floor((float(wz) - self.z_min) / self.cfg.fine_cell_m))
+            gx = (float(wx) - self.x_min) / self.cfg.fine_cell_m
+            gz = (float(wz) - self.z_min) / self.cfg.fine_cell_m
             if not (0 <= gx < self.nx and 0 <= gz < self.nz):
                 continue
-            tip_x = int(round(gx + arrow_length_cells * math.cos(yaw)))
-            tip_y = int(round(gz - arrow_length_cells * math.sin(yaw)))
+            cx = int(round(gx * s))
+            cy = int(round(gz * s))
+            tip_x = int(round(cx + arrow_px * math.cos(yaw)))
+            tip_y = int(round(cy - arrow_px * math.sin(yaw)))
             color_t = tuple(int(c) for c in color)
-            # Filled body marker + black outline for contrast against the
-            # potentially same-coloured coverage tint underneath.
-            cv2.circle(out, (gx, gz), marker_radius_cells, (0, 0, 0),
+            cv2.circle(out, (cx, cy), radius_px, (0, 0, 0),
                        thickness=-1, lineType=cv2.LINE_AA)
-            cv2.circle(out, (gx, gz), max(1, marker_radius_cells - 1),
+            cv2.circle(out, (cx, cy), max(1, radius_px - 1),
                        color_t, thickness=-1, lineType=cv2.LINE_AA)
-            # Heading arrow (slightly thicker stroke than 1 px so it survives
-            # downstream resize).
-            cv2.arrowedLine(out, (gx, gz), (tip_x, tip_y), (0, 0, 0),
-                            thickness=3, line_type=cv2.LINE_AA, tipLength=0.4)
-            cv2.arrowedLine(out, (gx, gz), (tip_x, tip_y), color_t,
-                            thickness=2, line_type=cv2.LINE_AA, tipLength=0.4)
+            cv2.arrowedLine(out, (cx, cy), (tip_x, tip_y), (0, 0, 0),
+                            thickness=outline_thick, line_type=cv2.LINE_AA,
+                            tipLength=0.4)
+            cv2.arrowedLine(out, (cx, cy), (tip_x, tip_y), color_t,
+                            thickness=stroke_thick, line_type=cv2.LINE_AA,
+                            tipLength=0.4)
         return out
+
+    @staticmethod
+    def _coarse_col_label(i: int) -> str:
+        """0->A, 1->B, ..., 25->Z, 26->AA, 27->AB, ..."""
+        n = i + 1
+        label = ""
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            label = chr(ord("A") + r) + label
+        return label
+
+    def coarse_label_for_world_xz(self, x: float, z: float) -> Optional[str]:
+        """Chess-style label (e.g. ``"C7"``) for the coarse cell that
+        contains world point ``(x, z)``, or ``None`` if out of bounds.
+
+        Coarse-cell origin is the AABB ``(x_min, z_min)`` corner, so
+        ``A1`` is the top-left coarse cell when looking at the rendered
+        map (low X, low Z). Column letter follows X (left -> right);
+        row number follows Z (top -> bottom)."""
+        coarse_m = float(self.cfg.coarse_cell_m)
+        col = int(math.floor((float(x) - self.x_min) / coarse_m))
+        row = int(math.floor((float(z) - self.z_min) / coarse_m))
+        n_cols = int(math.ceil(self.nx * self.cfg.fine_cell_m / coarse_m))
+        n_rows = int(math.ceil(self.nz * self.cfg.fine_cell_m / coarse_m))
+        if not (0 <= col < n_cols and 0 <= row < n_rows):
+            return None
+        return f"{self._coarse_col_label(col)}{row + 1}"
+
+    def draw_coarse_grid(
+        self,
+        img: np.ndarray,
+        cell_pixel_scale: float = 1.0,
+        line_color_bgr: tuple[int, int, int] = (170, 170, 170),
+        label_color_bgr: tuple[int, int, int] = (240, 240, 240),
+        label_bg_bgr: Optional[tuple[int, int, int]] = (0, 0, 0),
+        font_scale: float = 0.5,
+    ) -> np.ndarray:
+        """Overlay coarse ``coarse_cell_m`` grid lines + chess-style
+        labels in-place on ``img``.
+
+        Pass ``cell_pixel_scale`` = (image pixels per fine cell) when
+        drawing on an upscaled render so the lines align with cells.
+        Column letters (A, B, ...) march along +X (left -> right) and
+        row numbers (1, 2, ...) march along +Z (top -> bottom)."""
+        coarse_m = float(self.cfg.coarse_cell_m)
+        fine_per_coarse = max(1, int(round(coarse_m / self.cfg.fine_cell_m)))
+        s = float(cell_pixel_scale)
+        coarse_px = fine_per_coarse * s
+
+        h, w = img.shape[:2]
+        n_cols = int(math.ceil(self.nx / fine_per_coarse))
+        n_rows = int(math.ceil(self.nz / fine_per_coarse))
+        max_x = int(round(min(w - 1, self.nx * s)))
+        max_y = int(round(min(h - 1, self.nz * s)))
+
+        for i in range(n_cols + 1):
+            x = int(round(i * coarse_px))
+            if 0 <= x <= max_x:
+                cv2.line(img, (x, 0), (x, max_y), line_color_bgr,
+                         1, cv2.LINE_AA)
+        for j in range(n_rows + 1):
+            y = int(round(j * coarse_px))
+            if 0 <= y <= max_y:
+                cv2.line(img, (0, y), (max_x, y), line_color_bgr,
+                         1, cv2.LINE_AA)
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        for i in range(n_cols):
+            cx = int(round((i + 0.5) * coarse_px))
+            if not (0 <= cx <= max_x):
+                continue
+            label = self._coarse_col_label(i)
+            (tw, th), _ = cv2.getTextSize(label, font, font_scale, 1)
+            tx = cx - tw // 2
+            ty = th + 3
+            if label_bg_bgr is not None:
+                cv2.rectangle(
+                    img,
+                    (tx - 2, ty - th - 2),
+                    (tx + tw + 2, ty + 2),
+                    label_bg_bgr,
+                    thickness=-1,
+                )
+            cv2.putText(img, label, (tx, ty), font, font_scale,
+                        label_color_bgr, 1, cv2.LINE_AA)
+        for j in range(n_rows):
+            cy = int(round((j + 0.5) * coarse_px))
+            if not (0 <= cy <= max_y):
+                continue
+            label = str(j + 1)
+            (tw, th), _ = cv2.getTextSize(label, font, font_scale, 1)
+            tx = 3
+            ty = cy + th // 2
+            if label_bg_bgr is not None:
+                cv2.rectangle(
+                    img,
+                    (tx - 2, ty - th - 2),
+                    (tx + tw + 2, ty + 2),
+                    label_bg_bgr,
+                    thickness=-1,
+                )
+            cv2.putText(img, label, (tx, ty), font, font_scale,
+                        label_color_bgr, 1, cv2.LINE_AA)
+
+        return img
