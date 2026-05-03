@@ -65,11 +65,14 @@ cv2.waitKey(1)
 import habitat_sim
 
 from mumt_sim.agent.coverage import CoverageMap, CoverageMapConfig
+from mumt_sim.agent.detection import OnDemandDetector, YoloeClient
 from mumt_sim.agent.memory import MemoryTable, default_jsonl_path
 from mumt_sim.agent.perception import CaptionWorker, GemmaClient, OnDemandCaptioner
 from mumt_sim.agent.tools import (
     Controller,
     ControllerCtx,
+    FindLabelController,
+    FindResult,
     GotoController,
     MoveController,
     PrimitiveResult,
@@ -311,6 +314,43 @@ def main() -> None:
             flush=True,
         )
 
+    # YOLOE detector: feeds the FindLabelController. Same shape as the
+    # captioner pair -- one shared client behind a small thread pool.
+    # The Jetson endpoint is overridable via MUMT_YOLOE_URL; default
+    # is the laptop<->Jetson direct link.
+    on_demand_detector: Optional[OnDemandDetector] = None
+    try:
+        yoloe_client = YoloeClient(
+            base_url=os.environ.get("MUMT_YOLOE_URL"),
+            timeout_s=4.0,
+        )
+        # Optional health probe so we fail loudly NOW if the Jetson is
+        # unreachable, rather than silently when a primitive runs.
+        # Wrapped so a transient ping failure (slow first connect) does
+        # not abort the rig; the FindLabelController handles per-call
+        # errors with a per-detection error row.
+        try:
+            health = yoloe_client.health()
+            backend = (health.get("open") or {}).get("backend", "?")
+            print(
+                f"==> YOLOE detector ready ({yoloe_client.base_url}, "
+                f"backend={backend})",
+                flush=True,
+            )
+        except Exception as ping_exc:
+            print(
+                f"==> WARNING: YOLOE health probe failed at "
+                f"{yoloe_client.base_url} ({ping_exc}). Find primitive will "
+                f"surface per-call errors.",
+                flush=True,
+            )
+        on_demand_detector = OnDemandDetector(yoloe_client, max_workers=4)
+    except Exception as exc:
+        print(
+            f"==> WARNING: YOLOE detector disabled ({exc}).",
+            flush=True,
+        )
+
     print("==> opening teleop window. WASD drives Spot 0, arrows drive Spot 1.",
           flush=True)
     window = MultiPaneWindow(
@@ -333,8 +373,14 @@ def main() -> None:
     # hotkeys target.
     active_controllers: list[Optional[Controller]] = [None, None]
     primitive_ctxs: list[ControllerCtx] = [
-        ControllerCtx(sim=sim, spot_id=0, teleop=teleops[0], coverage=coverage),
-        ControllerCtx(sim=sim, spot_id=1, teleop=teleops[1], coverage=coverage),
+        ControllerCtx(
+            sim=sim, spot_id=0, teleop=teleops[0], coverage=coverage,
+            latest_camera_hfov_rad=math.radians(SPOT_HEAD_HFOV_DEG),
+        ),
+        ControllerCtx(
+            sim=sim, spot_id=1, teleop=teleops[1], coverage=coverage,
+            latest_camera_hfov_rad=math.radians(SPOT_HEAD_HFOV_DEG),
+        ),
     ]
     active_spot = 0
     last_primitive_result: list[Optional[PrimitiveResult]] = [None, None]
@@ -379,6 +425,40 @@ def main() -> None:
                     f"      objects: {objs}   "
                     f"people: {cap.people_visible if cap else 0}   "
                     f"anomalies: {anoms}",
+                    flush=True,
+                )
+        if isinstance(result, FindResult):
+            print(
+                f"  find {result.target_label!r} in {result.sector}: "
+                f"found={result.found}  approached={result.approached}  "
+                f"centered={result.centered}  "
+                f"detections_run={result.n_detections_run}  "
+                f"failed={result.n_detections_failed}  "
+                f"viewpoints={result.n_viewpoints_planned}",
+                flush=True,
+            )
+            best = result.best_detection
+            if best is not None and result.best_detection_pose is not None:
+                bx, bz, byaw = result.best_detection_pose
+                cx, cy = best.center_xy
+                w, h = result.best_detection_image_size_wh or (0, 0)
+                print(
+                    f"      best: {best.label!r} conf={best.confidence:.2f}  "
+                    f"bbox=({best.xyxy[0]:.0f},{best.xyxy[1]:.0f})-"
+                    f"({best.xyxy[2]:.0f},{best.xyxy[3]:.0f})  "
+                    f"center=({cx:.0f},{cy:.0f}) of {w}x{h}  "
+                    f"snap_pose=({bx:+.2f},{bz:+.2f}, yaw "
+                    f"{math.degrees(byaw):+5.1f})",
+                    flush=True,
+                )
+            if result.target_world_xz is not None:
+                tx, tz = result.target_world_xz
+                rng = result.target_range_m or 0.0
+                ax, az = (result.approach_world_xz or (float('nan'), float('nan')))
+                print(
+                    f"      target world ({tx:+.2f},{tz:+.2f})  "
+                    f"range_at_detect={rng:.2f}m  "
+                    f"approach_pt ({ax:+.2f},{az:+.2f})",
                     flush=True,
                 )
 
@@ -522,6 +602,53 @@ def main() -> None:
                             flush=True,
                         )
 
+            if state.find_pressed:
+                # H = both spots simultaneously hunt for "human" in EACH
+                # OTHER's current sector (mirrors the F-key cross-assign:
+                # spot0 -> spot1's sector, spot1 -> spot0's sector). Each
+                # FindLabelController plans its own viewpoint tour and
+                # fires the YOLOE Jetson server every 5 ticks; the first
+                # detection above the conf threshold cancels the rest of
+                # that spot's tour and rotates it to face the bbox.
+                if on_demand_detector is None:
+                    print(
+                        "[primitive] find requires the YOLOE server; "
+                        "set MUMT_YOLOE_URL or check the Jetson",
+                        flush=True,
+                    )
+                else:
+                    sector_for_spot_h: list[Optional[str]] = [None, None]
+                    for spot_id in (0, 1):
+                        p = spot_bodies[spot_id].translation
+                        sector_for_spot_h[spot_id] = (
+                            coverage.coarse_label_for_world_xz(float(p.x), float(p.z))
+                        )
+                    if sector_for_spot_h[0] is None or sector_for_spot_h[1] is None:
+                        print(
+                            f"[primitive] FIND skipped: spot0 sector="
+                            f"{sector_for_spot_h[0]}  spot1 sector="
+                            f"{sector_for_spot_h[1]} (None = outside AABB)",
+                            flush=True,
+                        )
+                    else:
+                        # Cross-assign: each spot hunts in the OTHER's sector.
+                        for spot_id in (0, 1):
+                            sector_label = sector_for_spot_h[1 - spot_id]
+                            _start_primitive(
+                                spot_id,
+                                FindLabelController(
+                                    sector=sector_label,
+                                    target_label="human",
+                                    on_demand=on_demand_detector,
+                                ),
+                            )
+                        print(
+                            f"[primitive] FIND parallel: spot0 hunts "
+                            f"'human' in {sector_for_spot_h[1]}, spot1 hunts "
+                            f"'human' in {sector_for_spot_h[0]}",
+                            flush=True,
+                        )
+
             # ----- step each spot: controller or keyboard mapper -----
             for spot_id in (0, 1):
                 ctl = active_controllers[spot_id]
@@ -537,14 +664,19 @@ def main() -> None:
             obs = sim.get_sensor_observations(sensor_ids)
             spot0_frame = obs[SPOT_0_HEAD_AGENT_ID][s0_rgb_uuid][:, :, :3]
             spot1_frame = obs[SPOT_1_HEAD_AGENT_ID][s1_rgb_uuid][:, :, :3]
+            spot0_depth = obs[SPOT_0_HEAD_AGENT_ID][s0_depth_uuid]
+            spot1_depth = obs[SPOT_1_HEAD_AGENT_ID][s1_depth_uuid]
 
-            # Refresh latest_rgb on each ctx so primitives running on the
-            # NEXT tick see this tick's frame (RGB order; Gemma encoder
-            # handles the channel swap).
+            # Refresh latest_rgb + latest_depth on each ctx so primitives
+            # running on the NEXT tick see this tick's frame. RGB stays
+            # in habitat-sim's native channel order; depth is a float32
+            # H x W array of camera-Z perpendicular distance in metres.
             primitive_ctxs[0].latest_rgb = spot0_frame
             primitive_ctxs[0].latest_rgb_is_bgr = False
+            primitive_ctxs[0].latest_depth = spot0_depth
             primitive_ctxs[1].latest_rgb = spot1_frame
             primitive_ctxs[1].latest_rgb_is_bgr = False
+            primitive_ctxs[1].latest_depth = spot1_depth
 
             # Hand the latest head-cam frame + sector to each caption
             # worker. Cheap (just stores a reference under a lock); the
@@ -648,7 +780,7 @@ def main() -> None:
                 f"memory rows: {len(memory)}",
                 f"active=spot{active_spot}   "
                 f"[Tab] swap  [G] goto-other  [M] +1m  [N] +90deg  "
-                f"[F] both-search-other  [X] abort",
+                f"[F] both-search-other  [H] both-find-human-other  [X] abort",
             ]
 
             window.show([
@@ -662,6 +794,8 @@ def main() -> None:
                 worker.stop(timeout=2.0)
         if on_demand_captioner is not None:
             on_demand_captioner.stop(wait=False)
+        if on_demand_detector is not None:
+            on_demand_detector.stop(wait=False)
         memory.close()
         window.close()
         sim.close()

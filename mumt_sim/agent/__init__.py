@@ -9,12 +9,21 @@ land:
                      JSONL persistence (M-Agent.2, slice E)
 - ``perception``  -- per-Spot Gemma 4 caption worker that posts rows
                      into ``memory`` (M-Agent.2, slice E)
-- ``tools``       -- atomic action primitives (`goto`, `move`) +
-                     `Controller` base for step-able autonomy
-                     (M-Agent.2, slice F)
+- ``detection``   -- HTTP client + thread-pool wrapper for the Jetson
+                     YOLOE server, used by the find-label primitive
+                     (M-Agent.2, slice G)
+- ``tools``       -- atomic action primitives (`goto`, `move`,
+                     `search`, `find`) + `Controller` base for
+                     step-able autonomy (M-Agent.2, slice F-G)
 - ``loop``        -- ReAct LLM agent loop (M-Agent.3+)
 """
 
+from .detection import (
+    Detection,
+    DetectionResponse,
+    OnDemandDetector,
+    YoloeClient,
+)
 from .memory import MemoryRow, MemoryTable, default_jsonl_path
 from .perception import (
     AMBIENT_CAPTION_PROMPT,
@@ -29,6 +38,10 @@ from .perception import (
 from .tools import (
     Controller,
     ControllerCtx,
+    FindLabelConfig,
+    FindLabelController,
+    FindObservation,
+    FindResult,
     GotoConfig,
     GotoController,
     MoveConfig,
@@ -48,6 +61,10 @@ __all__ = [
     "default_jsonl_path",
     "AMBIENT_CAPTION_PROMPT",
     "SEARCH_VIEWPOINT_PROMPT",
+    "Detection",
+    "DetectionResponse",
+    "OnDemandDetector",
+    "YoloeClient",
     "GemmaClient",
     "OnDemandCaptioner",
     "SearchViewpointCaption",
@@ -56,6 +73,10 @@ __all__ = [
     "CaptionWorker",
     "Controller",
     "ControllerCtx",
+    "FindLabelConfig",
+    "FindLabelController",
+    "FindObservation",
+    "FindResult",
     "GotoConfig",
     "GotoController",
     "MoveConfig",
