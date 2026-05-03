@@ -21,6 +21,9 @@ land:
 - ``loop``        -- per-Spot event-driven ReAct agent on top of the
                      above tools, using Gemini native function calling
                      (M-Agent.3, slice A)
+- ``orchestrator`` -- tiny LLM dispatcher that routes user chat to
+                     per-Spot ``loop.AgentLoop``s via tell/ask_user
+                     (M-Agent.3, slice B)
 """
 
 from .detection import (
@@ -89,6 +92,13 @@ from .loop import (
     format_state_block,
     parse_thinking_speak,
 )
+from .orchestrator import (
+    ROUTER_SYSTEM_PROMPT_TEMPLATE,
+    ROUTER_TOOL_NAMES,
+    OrchestratorClient,
+    OrchestratorLoop,
+    OrchestratorTraceEntry,
+)
 from .visibility import Viewpoint, plan_search_tour
 
 __all__ = [
@@ -153,4 +163,10 @@ __all__ = [
     "format_result_for_llm",
     "format_state_block",
     "parse_thinking_speak",
+    # orchestrator
+    "OrchestratorClient",
+    "OrchestratorLoop",
+    "OrchestratorTraceEntry",
+    "ROUTER_SYSTEM_PROMPT_TEMPLATE",
+    "ROUTER_TOOL_NAMES",
 ]

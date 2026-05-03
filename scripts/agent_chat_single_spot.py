@@ -344,6 +344,22 @@ def main() -> None:
             last_action["text"] = text
             last_action["t"] = time.monotonic()
 
+    last_alert: Dict[str, Optional[Any]] = {"text": None, "t": None}
+
+    def on_alert(spot_id: int, description: str) -> None:
+        bar = "!" * 60
+        sys.stdout.write("\a")  # terminal bell
+        print(
+            f"\n{bar}\n"
+            f"!!! ALERT from spot{spot_id} !!!\n"
+            f"!!! {description}\n"
+            f"{bar}",
+            flush=True,
+        )
+        with state_lock:
+            last_alert["text"] = description
+            last_alert["t"] = time.monotonic()
+
     agent = AgentLoop(
         spot_id=0,
         client=agent_client,
@@ -357,6 +373,7 @@ def main() -> None:
         on_speak=on_speak,
         on_thinking=on_thinking,
         on_action=on_action,
+        on_alert=on_alert,
     )
     agent.start()
 
@@ -563,12 +580,21 @@ def main() -> None:
                 speak = last_speak.get("text") or ""
                 thinking = last_thinking.get("text") or ""
                 action = last_action.get("text") or ""
+                alert_text = last_alert.get("text") or ""
+                alert_t = last_alert.get("t")
+            # Pin the alert in the HUD for 30 s after it fires.
+            alert_age = (
+                time.monotonic() - alert_t
+                if alert_t is not None else 1e9
+            )
             hud = [
                 f"spot0  pose=({body_pos.x:+.2f}, {body_pos.z:+.2f}) "
                 f"yaw {math.degrees(teleop.state.yaw):+5.1f}deg  "
                 f"sector={sector or '--'}",
                 agent_state_line,
             ]
+            if alert_text and alert_age < 30.0:
+                hud.append(f"!! ALERT: {alert_text[:80]}")
             if speak:
                 hud.extend(_wrap(f"said: {speak}", 70))
             if thinking:

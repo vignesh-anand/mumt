@@ -29,7 +29,7 @@ Output contract (parsed from the model's text + function calls)
     <speak>
     optional message to the human
     </speak>
-    [function_call: one of goto / move / search / find / recall / stop / wait / done]
+    [function_call: one of goto / move / search / find / recall / stop / wait / alert / done]
 
 Tools available to the model (see :data:`TOOL_DECLS`):
 
@@ -45,6 +45,11 @@ Tools available to the model (see :data:`TOOL_DECLS`):
 - ``stop()`` -- abort whatever primitive is currently running for me.
 - ``wait()`` -- explicit no-op; only valid when a primitive is
   running and the agent has no new instruction this turn.
+- ``alert(description)`` -- HIGH-PRIORITY notification to the user.
+  No controller dispatched; the harness's ``on_alert`` callback is
+  fired so the user gets a loud terminal banner / VR overlay /
+  whatever the embedding application surfaces. Used after a
+  successful ``find`` or any safety-relevant discovery.
 - ``done(answer)`` -- terminal: agent goes idle after writing a final
   message; chat history is preserved so a follow-up :class:`UserMessage`
   resumes context.
@@ -483,6 +488,34 @@ def _build_tool_decls():
             parameters=t.Schema(type=t.Type.OBJECT, properties={}, required=[]),
         ),
         t.FunctionDeclaration(
+            name="alert",
+            description=(
+                "HIGH-PRIORITY notification to the user, fired ONLY "
+                "when you have spotted a person. Use it the moment a "
+                "successful find matches a person, or when an ambient "
+                "caption made during a search reports a human in the "
+                "scene -- the harness will surface this loudly "
+                "(terminal bell, VR overlay, etc.) so the user can "
+                "stop what they are doing and pay attention. Do NOT "
+                "use it for objects, hazards, or routine status "
+                "updates -- `<speak>` is for those. After the alert "
+                "follow up with `done(answer)` next turn unless more "
+                "work is needed."
+            ),
+            parameters=t.Schema(
+                type=t.Type.OBJECT,
+                properties={
+                    "description": s(
+                        t.Type.STRING,
+                        "One-sentence description of the person and "
+                        "where they are (e.g. 'Person located in "
+                        "sector C2 at (-1.20, -3.40), 1 m away').",
+                    ),
+                },
+                required=["description"],
+            ),
+        ),
+        t.FunctionDeclaration(
             name="done",
             description=(
                 "Mark the current task as finished. `answer` is your "
@@ -500,7 +533,10 @@ def _build_tool_decls():
     return decls
 
 
-TOOL_NAMES = ("goto", "move", "search", "find", "recall", "stop", "wait", "done")
+TOOL_NAMES = (
+    "goto", "move", "search", "find", "recall",
+    "stop", "wait", "alert", "done",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +911,8 @@ Tools you can call:
 - find(label, sector)  YOLOE-driven hunt for an object
 - recall(question)     memory-LLM query over your own past observations
 - stop()               abort the primitive currently running for you
+- wait()               explicit no-op for this turn
+- alert(description)   HIGH-PRIORITY notification, only when you see a person
 - done(answer)         finish this task; preserves chat for the next message
 
 Sectors and the world
@@ -936,6 +974,21 @@ Behaviour rules
    is rejected with a `ToolFailed status=busy` event -- nothing
    changes in the world.
 6. Always end a task with `done(answer)`. Do not just stop replying.
+7. **Use `alert(description)` ONLY when you have spotted a person.**
+   This includes: a successful `find(label="person"|"human"|...)`
+   matching a person (call `alert` immediately on the FOUND
+   ToolProgress, do not wait for the controller to finish); or, in
+   the middle of a `search`, an ambient caption that reports a
+   person you were not specifically hunting for. The user may be
+   busy elsewhere (talking, looking at VR, etc.) -- alert is the
+   channel that grabs their attention when a human shows up. After
+   the alert, follow up with `done(answer)` on the next turn unless
+   there is genuinely more work to do. Do NOT use alert for any
+   other discovery (objects, hazards, room layout) and do NOT use
+   it for routine status updates or task completion -- `<speak>`
+   and `done` cover those. Keep the description to one sentence
+   with the where + what (sector, coordinates, brief description
+   of the person if you have it).
 7. If the user gives an ambiguous sector reference like "B" or "the
    kitchen", pick the best concrete sector based on `<state>` (your
    current sector, the user's sector) or memory; then act on that
@@ -1031,6 +1084,7 @@ class AgentLoop:
         on_speak: Optional[Callable[[int, str], None]] = None,
         on_thinking: Optional[Callable[[int, str], None]] = None,
         on_action: Optional[Callable[[int, str], None]] = None,
+        on_alert: Optional[Callable[[int, str], None]] = None,
         max_steps_per_task: int = 30,
         per_call_timeout_s: float = 30.0,
         history_cap_turns: int = 40,
@@ -1047,6 +1101,7 @@ class AgentLoop:
         self.on_speak = on_speak
         self.on_thinking = on_thinking
         self.on_action = on_action
+        self.on_alert = on_alert
         self.max_steps_per_task = int(max_steps_per_task)
         self.per_call_timeout_s = float(per_call_timeout_s)
         self.history_cap_turns = int(history_cap_turns)
@@ -1332,6 +1387,25 @@ class AgentLoop:
 
         if name == "wait":
             return "wait()"
+
+        if name == "alert":
+            description = str(args.get("description", "")).strip()
+            if not description:
+                self.bus.put(ToolFailed(
+                    name="alert", status="unreachable",
+                    reason="alert requires a non-empty description",
+                ))
+                return "alert() -- empty description"
+            if self.on_alert:
+                try:
+                    self.on_alert(self.spot_id, description)
+                except Exception as exc:
+                    print(
+                        f"[agent spot{self.spot_id}] on_alert raised "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+            return f"alert(description={description!r})"
 
         if name == "goto":
             target = str(args.get("target", "")).strip()
