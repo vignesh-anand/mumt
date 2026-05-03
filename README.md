@@ -8,11 +8,14 @@ Eventual VR embodiment of the human via Habitat-HITL.
 - **M1 (done):** isolated environment, fresh habitat-sim + habitat-lab source clones,
   one HSSD scene + Spot URDF + humanoid URDFs, headless render of 2 kinematic Spots
   and 1 kinematic humanoid with per-Spot pan/tilt RGB-D heads.
-- **M2a (in progress):** keyboard teleop of Spot 0 with continuous diff-drive
+- **M2a (done):** keyboard teleop of Spot 0 with continuous diff-drive
   velocity + arrow-key pan/tilt, live split-screen display.
 - **M2b/c (planned):** autonomous geodesic-follower Spots, SMPL-X walking humanoid.
-- **M3 (planned):** HITL desktop viewer -> HITL VR with USB-tethered Quest -> floating
-  HUD panels (Spot feeds + custom map).
+- **M3a (done):** habitat-hitl runtime stack validation - Unity Editor
+  on Linux acts as the VR client over localhost. No headset yet.
+- **M3b/c (planned):** sideload Unity client APK to Quest 2 over USB-tether,
+  then a custom mumt HITL app with embodied human + VR-driven Spot teleop +
+  floating HUD panels.
 
 See `/home/vignesh/.cursor/plans/` for the live planning docs and the
 [Milestones](#milestones) section below for the running technical journal.
@@ -35,6 +38,9 @@ mumt/
   scripts/
     01_install_env.sh                 # bootstrap venv + clone + build
     02_fetch_assets.sh                # hf login + dataset_downloader + hf download
+    03_install_unity_hub.sh           # M3a.1: apt install unityhub (sudo)
+    04_install_vr_assets.sh           # M3a.2: clone unity client + magnum env
+    06_run_sim_viewer_server.sh       # M3a.3: run habitat-hitl server on :8888
     render_two_spots_one_human.py     # M1 deliverable
     teleop_spot.py                    # M2a deliverable
   renders/                            # output PNGs (gitignored)
@@ -233,3 +239,155 @@ so the cv2 window does NOT need keyboard focus, but typing in another app
 - No screenshot / recording key. Add later if needed (5 lines via ``imageio``).
 - No mouse capture / FPS-style look. The arrow keys are the head; revisit when
   we add a desktop "embody the human" mode in M2b/c.
+
+### M3a - Habitat-HITL runtime stack validation
+
+**Goal:** prove that habitat-hitl's official VR pipeline (``pick_throw_vr``
+example + Unity client) runs end-to-end on this Linux box, with Unity Editor
+acting as the client over localhost. No headset yet; this checkpoint exists
+so we can fail fast on Unity / dataset-conversion / networking issues before
+investing in headset deployment (M3b) or a custom mumt VR app (M3c).
+
+**Architecture refresher:** habitat-hitl's VR is *not* Quest Link. The Linux
+process is a server that streams scene state over TCP to a Unity-based client.
+The client renders locally on whatever hardware it runs on (Unity Editor on
+Linux for M3a, sideloaded Android APK on the Quest for M3b). USB tether to the
+Quest is just TCP-over-USB; Quest Link / Air Link are not involved.
+
+**M3a.1 - Install Unity Hub + project-specific Editor:**
+
+```bash
+sudo bash scripts/03_install_unity_hub.sh        # apt repo install
+git clone --depth 1 https://github.com/eundersander/siro_hitl_unity_client.git \
+    third_party/siro_hitl_unity_client            # already cloned by 04_install_vr_assets.sh
+unityhub                                          # launch the GUI
+```
+
+Then in the Unity Hub GUI (manual, one-time):
+
+1. Sign in with a Unity account (Personal license is free; create one at
+   id.unity.com if you don't have one).
+2. Click ``Open`` -> ``Add project from disk``, pick
+   ``third_party/siro_hitl_unity_client``. Hub will say
+   ``Editor 2022.3.7f1 is required, install it?`` -> yes. This is the exact
+   patch the project targets; opening the project directly avoids the
+   guess-the-LTS-patch problem.
+3. On the install modules page, tick **Android Build Support** (we'll need it
+   for M3b; cheaper to add now than re-trigger the editor download later) and
+   accept its sub-modules (``OpenJDK``, ``Android SDK & NDK Tools``).
+4. Wait for the editor + modules to download. Disk: ~12 GB. Goes under
+   ``~/Unity/Hub/Editor/2022.3.7f1/`` by default; outside this repo on purpose.
+
+Validation: Unity Hub's ``Installs`` tab shows ``2022.3.7f1`` with the
+Android module checkmark, no red errors.
+
+**M3a.2 - Local Unity sanity test (no server, no data processing):**
+
+The Unity client ships with one bundled test asset, so we can validate the
+Unity-side install in isolation before fighting with the dataset pipeline.
+
+1. In Unity Hub, double-click the ``siro_hitl_unity_client`` project to open
+   it in Unity Editor 2022.3.7f1.
+2. ``File`` -> ``Open Scene`` -> ``Assets/Scenes/PlayerVR``.
+3. From the Project pane, navigate to ``Assets/temp/``, drag
+   ``106879104_174887235`` into the Scene pane. You should see HSSD walls + floors.
+4. Hit Play (top-center button). After a brief load, you should see a
+   first-person view with simulated VR controllers, navigable via WASD + mouse.
+
+Validation: Play mode shows a stage and the XR Device Simulator overlay; no
+red errors in the Console pane. After validating, drag the dropped object out
+of the Hierarchy / undo it so the scene goes back to clean state.
+
+**M3a.3 - Localhost server smoke test:**
+
+```bash
+# Terminal 1: habitat-hitl server, headless, on ws://127.0.0.1:8888
+bash scripts/06_run_sim_viewer_server.sh
+# wait for: "NetworkManager started on networking thread.
+#            Listening for client websocket connections on port 8888..."
+```
+
+```
+Terminal 2: Unity Editor still has Assets/Scenes/PlayerVR open from M3a.2.
+            Hit ▶ Play. The Console should show "Connected to ws://127.0.0.1:8888"
+            and a recurring "Message rate: ~10/s" line. The Game view streams
+            HSSD scene 102344049 from habitat instead of the bundled test asset.
+```
+
+Validation: server log prints ``Client is ready!`` exactly once per Unity Play
+session; Unity Console has no red errors and shows steady message rate; Game
+view shows the streamed scene.
+
+To stop: Ctrl-C the server, then click ▶ in Unity to exit Play.
+
+**Conventions established here:**
+
+- Linux + Wired Quest = **Unity APK + TCP-over-USB**, never Quest Link / Air
+  Link. (Linux has no first-party Quest Link support; the apt-installed
+  ``unityhub`` is the official path.)
+- Unity Editor lives outside this repo (``~/Unity/Hub/``) - it's a
+  multi-project tool, not a per-project dependency.
+- ``scripts/06_run_sim_viewer_server.sh`` is the canonical localhost server.
+  It runs habitat-hitl's ``sim_viewer`` example app in headless mode
+  (``habitat_hitl.experimental.headless.do_headless=True`` +
+  ``habitat_hitl.window=null``) so we can iterate on the server without
+  fighting an extra GLX window. The Unity client is the *only* renderer at
+  M3a.3; if you want to see the scene you need Unity in Play mode.
+- Server port is ``8888`` because the Unity client (``NetworkClient.cs``,
+  ``defaultServerPort = 8888``) is hard-coded to that. We override habitat-hitl's
+  default ``18000`` instead of patching Unity, since Unity rebuilds are slow.
+
+**Problems hit and how we solved them:**
+
+- Originally planned to install Unity Hub via AppImage; Unity now serves Linux
+  only via apt
+  -> ``scripts/03_install_unity_hub.sh`` adds the Unity apt key + repo and
+     installs ``unityhub`` (sudo required - no clean way around it).
+- Unity Hub kept offering Unity 6.x by default; the client project targets
+  Unity 2022.3 LTS specifically and Unity 6's XR packages have breaking changes
+  -> open the project via "Add project from disk" so Hub auto-prompts the
+     correct ``2022.3.7f1`` install. Latest 2022.3 patch (``2022.3.62f3``)
+     also works and is what we landed on.
+- Default ``sim_viewer`` GUI mode crashed on
+  ``module '_magnum.text' has no attribute 'Renderer2D'`` (text drawer / magnum
+  ABI mismatch in our pinned wheels)
+  -> run server in headless mode (``do_headless=True`` + ``window=null``).
+     Unity is the only renderer we care about anyway.
+- Unity client (``eundersander/siro_hitl_unity_client`` HEAD ``dbfa5a6``) is
+  on an older protocol than our habitat-hitl: it never sends
+  ``isClientReady`` and writes ``connection_params_dict`` (snake_case) instead
+  of ``connectionParamsDict`` (camelCase). The server's
+  ``send_connection_record_to_main_thread`` ``assert "isClientReady" in ...``
+  fired silently (``AssertionError`` with empty message), surfacing as
+  ``Error receiving from client: `` followed by an instant disconnect, and
+  Unity went into a 4 s reconnect loop
+  -> instead of forking the abandoned upstream client we inject the missing
+     field via the server's own ``mock_connection_params_dict`` test hook:
+     ``+habitat_hitl.networking.mock_connection_params_dict.isClientReady=true``.
+     See the comment at the top of ``scripts/06_run_sim_viewer_server.sh``.
+- A failing networking subprocess (port-in-use) does not bring down the
+  outer ``sim_viewer`` main process; the server keeps stepping silently and
+  Unity ends up connected to whatever orphan was already on ``:8888``
+  -> if you see ``OSError: [Errno 98] address already in use`` in the log,
+     ``pkill -f sim_viewer.py`` and start over. Future polish: bind-check
+     in the wrapper before launching.
+
+**What we deliberately punted:**
+
+- **Asset pipeline.** The Unity client is supposed to render scenes with full
+  HSSD geometry by reading prebaked GLBs from
+  ``Assets/Resources/data/`` (populated by ``habitat_dataset_processing`` +
+  ``magnum-tools``). We deliberately skipped that pipeline at M3a.3:
+  habitat-hitl's gfx-replay stream still drives Unity's networking,
+  ``GfxReplayPlayer`` still resolves load instructions, and any unresolved
+  GLB simply fails to spawn (instead of crashing the run). That's enough to
+  prove the *runtime* stack works. Full asset baking moves to M3b alongside
+  the Quest deploy, since both need the same prerequisite (``magnum-tools``
+  GitHub-Actions artifact + ``.venv-magnum``).
+- ``scripts/04_install_vr_assets.sh`` already creates ``.venv-magnum`` and
+  the ``habitat_dataset_processing`` install, so M3b only needs the manual
+  ``magnum-tools`` artifact download + a wrapper around ``unity_dataset_processing.py``.
+- No headset / APK build yet (M3b).
+- No custom HITL app yet; ``sim_viewer`` is used unmodified at M3a.3 (M3c).
+- No automation of the Unity Hub login or editor install - the Unity Hub GUI
+  has no headless install mode that doesn't require a Unity account login.

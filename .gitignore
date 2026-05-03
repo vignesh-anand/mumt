@@ -1,5 +1,6 @@
-# venv
+# venvs
 .venv/
+.venv-magnum/
 
 # habitat source clones (we treat them as opaque dependencies)
 third_party/
