@@ -43,14 +43,15 @@ from pynput import keyboard
 # - "primitive trigger" letters fire edge-only events for autonomous tools:
 #   G = goto, M = move forward, N = turn (90 deg left), X = abort current
 #   primitive on the active Spot, F = search the active Spot's current sector,
-#   H = "hunt" -- find a labelled object (e.g. human) in the current sector.
-_LETTER_KEYS = {"w", "s", "a", "d", "r", "g", "m", "n", "x", "f", "h"}
+#   H = "hunt" -- find a labelled object (e.g. human) in the current sector,
+#   Q = "query" -- LLM recall over the perception memory table.
+_LETTER_KEYS = {"w", "s", "a", "d", "r", "g", "m", "n", "x", "f", "h", "q"}
 _NAV_KEYS = {"up", "down", "left", "right"}
 _MOD_KEYS = {"shift"}
 
 # Edge-triggered letter keys: rising edge produces a one-shot event,
 # the held set still tracks them so we can debounce.
-_EDGE_LETTERS = {"r", "g", "m", "n", "x", "f", "h"}
+_EDGE_LETTERS = {"r", "g", "m", "n", "x", "f", "h", "q"}
 
 
 @dataclass
@@ -76,6 +77,7 @@ class InputState:
     abort_pressed: bool = False          # X  (abort active spot's primitive)
     search_pressed: bool = False         # F  (search active spot's current sector)
     find_pressed: bool = False           # H  (find labelled target in current sector)
+    recall_pressed: bool = False         # Q  (LLM recall over perception memory)
 
 
 class _PynputTracker:
@@ -96,6 +98,7 @@ class _PynputTracker:
         "x": "abort",
         "f": "search",
         "h": "find",
+        "q": "recall",
     }
 
     def __init__(self) -> None:
@@ -111,6 +114,7 @@ class _PynputTracker:
             "abort": False,
             "search": False,
             "find": False,
+            "recall": False,
         }
         self._listener = keyboard.Listener(
             on_press=self._on_press, on_release=self._on_release
@@ -299,6 +303,7 @@ class SplitScreenWindow:
             abort_pressed=edges["abort"],
             search_pressed=edges["search"],
             find_pressed=edges["find"],
+            recall_pressed=edges["recall"],
         )
 
     def should_close(self) -> bool:
@@ -494,6 +499,7 @@ class MultiPaneWindow:
             abort_pressed=edges["abort"],
             search_pressed=edges["search"],
             find_pressed=edges["find"],
+            recall_pressed=edges["recall"],
         )
 
     def should_close(self) -> bool:

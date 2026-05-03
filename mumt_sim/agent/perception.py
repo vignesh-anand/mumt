@@ -2,10 +2,15 @@
 
 One ``CaptionWorker`` runs per Spot. Every ``period`` seconds it grabs
 the latest head-cam RGB frame (snapshotted from the main thread) plus
-the Spot's body XZ + sim time, sends the frame to Gemma 4 via the
-``google-genai`` SDK, asks for a strict JSON ``{room_name, objects,
-scene_description}`` response, and appends a :class:`MemoryRow` to the
-shared :class:`MemoryTable`.
+the Spot's body XZ + sim time, sends the frame to a Gemini multimodal
+model via the ``google-genai`` SDK, asks for a strict JSON
+``{room_name, objects, scene_description}`` response, and appends a
+:class:`MemoryRow` to the shared :class:`MemoryTable`.
+
+The default model is ``gemini-3.1-flash-lite-preview`` -- multimodal, fast
+(~1-3 s per call) and cheap. Override via the ``model=`` kwarg on
+:class:`GeminiClient` or, for the teleop demo, the
+``MUMT_CAPTION_MODEL`` env var.
 
 Threading model:
 - One worker thread per Spot. Workers never touch the simulator
@@ -13,7 +18,7 @@ Threading model:
   :meth:`CaptionWorker.post_observation` (cheap, just stores the latest
   frame + metadata under a lock).
 - The main loop is non-blocking: it just posts the latest snapshot and
-  carries on. The HTTP call to Gemma happens entirely off-thread.
+  carries on. The HTTP call happens entirely off-thread.
 - ``MemoryTable.append`` is the only point of cross-thread mutation,
   and it is itself lock-guarded.
 
@@ -58,7 +63,7 @@ def _api_key_from_env() -> Optional[str]:
     return None
 
 
-_DEFAULT_MODEL = "gemma-4-26b-a4b-it"
+_DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
 
 # ---------------------------------------------------------------------------
 # Prompts + parsers
@@ -107,11 +112,14 @@ class _Snapshot:
     rgb_is_bgr: bool
     t_sim: float
     sector: Optional[str]
+    pose_x: float
+    pose_z: float
+    pose_yaw_rad: float
 
 
 @dataclass
 class SearchViewpointCaption:
-    """Parsed Gemma response for a single search-mode viewpoint."""
+    """Parsed caption response for a single search-mode viewpoint."""
 
     summary: str
     objects_of_interest: list[str]
@@ -157,7 +165,7 @@ def _extract_json_object(raw: str) -> Optional[dict]:
 
 def parse_ambient_caption(raw: str) -> tuple[str, list[str], str]:
     """Pull ``(room_name, objects, scene_description)`` out of a raw
-    Gemma response; falls back to ``("unknown", [], <truncated raw>)``
+    captioner response; falls back to ``("unknown", [], <truncated raw>)``
     if JSON parsing fails."""
     obj = _extract_json_object(raw)
     if obj is None:
@@ -173,7 +181,7 @@ def parse_ambient_caption(raw: str) -> tuple[str, list[str], str]:
 
 
 def parse_search_caption(raw: str) -> SearchViewpointCaption:
-    """Pull a :class:`SearchViewpointCaption` out of a raw Gemma
+    """Pull a :class:`SearchViewpointCaption` out of a raw captioner
     response; falls back to a stub with the raw text in ``summary`` if
     JSON parsing fails."""
     obj = _extract_json_object(raw)
@@ -210,19 +218,22 @@ def parse_search_caption(raw: str) -> SearchViewpointCaption:
     )
 
 
-class GemmaClient:
-    """Tiny wrapper around the ``google-genai`` SDK. Schema-agnostic:
-    callers pass a prompt and get back the raw text response, then run
-    their own parser (``parse_ambient_caption``,
-    ``parse_search_caption``, etc).
+class GeminiClient:
+    """Tiny wrapper around the ``google-genai`` SDK for multimodal
+    (image + text) captioning. Schema-agnostic: callers pass a prompt
+    and get back the raw text response, then run their own parser
+    (``parse_ambient_caption``, ``parse_search_caption``, etc).
+
+    Default model is ``gemini-3.1-flash-lite-preview`` -- multimodal, ~1-3 s
+    per call, much faster than the 26B-class Gemma-4 we originally
+    used. Override via ``model=``.
 
     The client is cheap to construct but does hold a TCP connection
     pool inside the SDK, so reuse one instance across workers.
 
     ``max_output_tokens`` and ``temperature`` are forwarded to every
     ``generate_content`` call. We default to a small token cap because
-    our schemas all want short JSON; this is the single biggest knob
-    on per-call latency for a 26B-class model."""
+    our schemas all want short JSON."""
 
     def __init__(
         self,
@@ -251,11 +262,10 @@ class GemmaClient:
         rgb_is_bgr: bool = True,
         jpeg_quality: int = 80,
     ) -> str:
-        """Block-call Gemma with one image + one text prompt. Returns
-        the raw response text (stripped). Raises on transport
+        """Block-call the model with one image + one text prompt.
+        Returns the raw response text (stripped). Raises on transport
         failures."""
         jpeg = _encode_jpeg(rgb, rgb_is_bgr=rgb_is_bgr, quality=jpeg_quality)
-        # Image-before-text is the recommended order for Gemma 4.
         resp = self._client.models.generate_content(
             model=self.model,
             contents=[
@@ -293,26 +303,26 @@ class GemmaClient:
 
 
 class OnDemandCaptioner:
-    """Small thread-pool executor wrapping a :class:`GemmaClient`.
-    Lets the main loop fire off a Gemma call from a controller without
-    blocking the tick: ``submit(rgb, prompt, parser)`` returns a
-    :class:`concurrent.futures.Future` whose result is whatever
+    """Small thread-pool executor wrapping a :class:`GeminiClient`.
+    Lets the main loop fire off a caption call from a controller
+    without blocking the tick: ``submit(rgb, prompt, parser)`` returns
+    a :class:`concurrent.futures.Future` whose result is whatever
     ``parser(raw_text)`` returns.
 
-    ``max_workers`` controls how many Gemma calls can be in-flight
-    concurrently. We default to 2 so that if a controller times out a
+    ``max_workers`` controls how many calls can be in-flight
+    concurrently. We default to 6 so that if a controller times out a
     call and abandons its future, the underlying HTTP call can keep
     running on its own worker without blocking the next ``submit``
     from the same (or another) controller. Set to 1 to fully
     serialise.
 
-    The TCP pool inside the wrapped ``GemmaClient`` is shared with
+    The TCP pool inside the wrapped ``GeminiClient`` is shared with
     whatever ambient ``CaptionWorker``s use the same client.
     """
 
     def __init__(
         self,
-        client: GemmaClient,
+        client: GeminiClient,
         max_workers: int = 6,
         name: str = "OnDemandCaptioner",
     ) -> None:
@@ -329,7 +339,7 @@ class OnDemandCaptioner:
         rgb_is_bgr: bool = True,
         jpeg_quality: int = 80,
     ) -> "_cf.Future[Any]":
-        """Queue a Gemma call. The submitted ``rgb`` must outlive the
+        """Queue a caption call. The submitted ``rgb`` must outlive the
         call (we copy a reference, not the buffer); the teleop loop
         already produces fresh ``obs[...]`` arrays each tick so that's
         satisfied. ``parser`` is run on the worker thread so the
@@ -354,9 +364,9 @@ class CaptionWorker:
     :meth:`stop` at tear-down. The main loop posts the latest head-cam
     snapshot via :meth:`post_observation` every tick (cheap); the
     worker thread wakes every ``period`` seconds, grabs the most
-    recent snapshot, calls Gemma, appends a row to ``memory``.
+    recent snapshot, calls the captioner, appends a row to ``memory``.
 
-    The worker survives Gemma errors -- on failure it appends a row
+    The worker survives caption errors -- on failure it appends a row
     with empty payload and the error message in ``raw_response``, then
     sleeps until the next period and retries. This keeps the rest of
     the pipeline running and the failures auditable.
@@ -365,7 +375,7 @@ class CaptionWorker:
     def __init__(
         self,
         spot_id: int,
-        client: GemmaClient,
+        client: GeminiClient,
         memory: MemoryTable,
         period_s: float = 2.0,
         warmup_s: float = 0.5,
@@ -387,15 +397,24 @@ class CaptionWorker:
         rgb: np.ndarray,
         t_sim: float,
         sector: Optional[str],
+        pose_x: float,
+        pose_z: float,
+        pose_yaw_rad: float,
         rgb_is_bgr: bool = True,
     ) -> None:
-        """Stash the latest head-cam RGB so the worker can read it. The
-        frame is NOT copied here -- the caller must hand in a frame
-        whose backing storage will not be overwritten before the
-        worker grabs it. The teleop main loop already produces a fresh
-        ``obs[...]`` ndarray per tick, which satisfies this."""
+        """Stash the latest head-cam RGB + pose snapshot so the worker
+        can read it. The frame is NOT copied here -- the caller must
+        hand in a frame whose backing storage will not be overwritten
+        before the worker grabs it. The teleop main loop already
+        produces a fresh ``obs[...]`` ndarray per tick, which
+        satisfies this.
+
+        ``pose_x``, ``pose_z``, ``pose_yaw_rad`` are the body XZ + yaw
+        at frame-grab time and end up on the resulting :class:`MemoryRow`."""
         snap = _Snapshot(
-            rgb=rgb, rgb_is_bgr=rgb_is_bgr, t_sim=float(t_sim), sector=sector
+            rgb=rgb, rgb_is_bgr=rgb_is_bgr, t_sim=float(t_sim), sector=sector,
+            pose_x=float(pose_x), pose_z=float(pose_z),
+            pose_yaw_rad=float(pose_yaw_rad),
         )
         with self._latest_lock:
             self._latest = snap
@@ -428,8 +447,8 @@ class CaptionWorker:
             return snap
 
     def _run(self) -> None:
-        # Stagger workers slightly so they don't both call Gemma at the
-        # same instant -- offset by ``warmup_s * spot_id`` keeps the
+        # Stagger workers slightly so they don't both fire HTTP calls at
+        # the same instant -- offset by ``warmup_s * spot_id`` keeps the
         # API load smooth.
         if self.warmup_s > 0:
             self._stop.wait(self.warmup_s * self.spot_id)
@@ -456,6 +475,9 @@ class CaptionWorker:
                     t_wall=t_wall,
                     spot_id=self.spot_id,
                     sector=snap.sector,
+                    pose_x=snap.pose_x,
+                    pose_z=snap.pose_z,
+                    pose_yaw_rad=snap.pose_yaw_rad,
                     room_name=room,
                     objects=objs,
                     scene_description=scene,
@@ -467,9 +489,12 @@ class CaptionWorker:
                     t_wall=t_wall,
                     spot_id=self.spot_id,
                     sector=snap.sector,
+                    pose_x=snap.pose_x,
+                    pose_z=snap.pose_z,
+                    pose_yaw_rad=snap.pose_yaw_rad,
                     room_name="error",
                     objects=[],
                     scene_description="",
-                    raw_response=f"<gemma error: {type(exc).__name__}: {exc}>",
+                    raw_response=f"<caption error: {type(exc).__name__}: {exc}>",
                 )
             self.memory.append(row)

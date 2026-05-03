@@ -19,13 +19,18 @@ Primitives in this module:
   primitives and a manual "nudge" tool.
 - :class:`SearchSectorController` -- random-sample greedy set-cover
   viewpoint planner + tour executor. Goes to K viewpoints inside a
-  named sector, asks Gemma a search-tuned caption at each, returns a
-  structured :class:`SearchResult` to the caller.
+  named sector, asks the captioner for a search-tuned caption at each,
+  returns a structured :class:`SearchResult` to the caller.
 - :class:`FindLabelController` -- same planner + tour executor, but
   fires the YOLOE Jetson server (via :class:`OnDemandDetector`) every
   N ticks looking for a target label. On the first hit it aborts the
   remaining tour, computes a yaw offset from the bbox center, and
   rotates the spot to face the target.
+- :class:`RecallController` -- LLM-backed query over the perception
+  memory table. Snapshots :class:`MemoryTable`, dumps every row into
+  a Gemini Flash Lite call (via :class:`OnDemandRecaller`), returns a
+  :class:`RecallResult` with the model's prose answer. Holds no
+  motion -- the spot stays put while the call runs.
 
 All motion is routed through ``SpotTeleop.drive``, so the navmesh
 clamp, AO push, and HUD pose all stay consistent with the keyboard
@@ -50,11 +55,18 @@ import itertools
 
 from .coverage import CoverageMap
 from .detection import Detection, DetectionResponse, OnDemandDetector
+from .memory import MemoryRow, MemoryTable
 from .perception import (
     SEARCH_VIEWPOINT_PROMPT,
     OnDemandCaptioner,
     SearchViewpointCaption,
     parse_search_caption,
+)
+from .recall import (
+    RECALL_SYSTEM_PROMPT,
+    OnDemandRecaller,
+    build_recall_user_prompt,
+    format_memory_dump,
 )
 from .visibility import Viewpoint, plan_search_tour
 
@@ -137,7 +149,7 @@ class ControllerCtx:
 
     ``latest_rgb`` is the most recent head-cam frame, refreshed by the
     main loop each tick. Controllers that need a frame snapshot (e.g.
-    :class:`SearchSectorController` calling Gemma) read it directly.
+    :class:`SearchSectorController` calling the captioner) read it directly.
     None until the first frame arrives.
 
     ``latest_rgb_is_bgr`` matches the channel order of the frame above
@@ -160,6 +172,7 @@ class ControllerCtx:
     spot_id: int
     teleop: SpotTeleop
     coverage: Optional[CoverageMap] = None
+    memory: Optional[MemoryTable] = None
     latest_rgb: Optional[np.ndarray] = None
     latest_rgb_is_bgr: bool = False
     latest_depth: Optional[np.ndarray] = None
@@ -630,11 +643,11 @@ class MoveController(Controller):
 class SearchObservation:
     """One viewpoint's worth of evidence inside a :class:`SearchResult`.
 
-    ``caption`` is the parsed Gemma response when the on-demand caption
-    succeeded; ``error`` is set instead when goto / face / Gemma all
-    failed for this viewpoint (we still record the viewpoint so the
-    caller sees what the planner intended). Exactly one of ``caption``
-    / ``error`` is set.
+    ``caption`` is the parsed captioner response when the on-demand
+    caption succeeded; ``error`` is set instead when goto / face /
+    caption all failed for this viewpoint (we still record the
+    viewpoint so the caller sees what the planner intended). Exactly
+    one of ``caption`` / ``error`` is set.
     """
 
     viewpoint: Viewpoint
@@ -674,19 +687,19 @@ class SearchSectorConfig:
     plan_timeout_s: float = 10.0
     """Cap on the background plan_search_tour call. The default
     n_positions=100 typically completes in ~3 s."""
-    caption_timeout_s: float = 20.0
-    """Cap on each per-viewpoint Gemma call; we move on after this.
-    Tuned for Gemma 4 26B which routinely takes 5-15 s per call.
+    caption_timeout_s: float = 8.0
+    """Cap on each per-viewpoint caption call; we move on after this.
+    Tuned for Gemini Flash Lite which typically returns in ~1-3 s.
     NOTE: cancelling a future that has already started running does
     not abort the underlying HTTP call -- the request continues to
     consume an OnDemandCaptioner worker until it actually completes.
     Give the captioner ``max_workers >= 2`` so timed-out calls don't
     block subsequent submits."""
-    overall_timeout_s: float = 240.0
+    overall_timeout_s: float = 120.0
     """Hard wall-clock cap on the whole primitive."""
     settle_after_face_s: float = 0.25
     """Brief pause after the face-yaw move so the head image stops
-    motion-blurring before we snapshot it for Gemma."""
+    motion-blurring before we snapshot it for the captioner."""
 
 
 class SearchSectorController(Controller):
@@ -969,7 +982,7 @@ class SearchSectorController(Controller):
             self._goto = GotoController((vp.x, vp.z))
 
     def _record_skipped(self, reason: str) -> None:
-        """Record a failure for the CURRENT viewpoint (no Gemma call
+        """Record a failure for the CURRENT viewpoint (no caption call
         was made). Distinct from caption failures recorded during
         drain."""
         vp_idx = self._idx
@@ -1043,7 +1056,7 @@ class SearchSectorController(Controller):
             self._record_skipped("caption: no RGB frame available on ctx")
             self._advance()
             return None
-        # Hand the live frame to Gemma. We deliberately don't copy it:
+        # Hand the live frame to the captioner. We deliberately don't copy it:
         # the teleop loop allocates a fresh ndarray each tick so the
         # OnDemandCaptioner thread holds a Python ref that keeps the
         # buffer alive until the JPEG encode is done.
@@ -1873,5 +1886,201 @@ class FindLabelController(Controller):
         if res is None:
             return None
         self._centered = res.status == "success"
+        self._phase = "done"
+        return None
+
+
+# ---------------------------------------------------------------------------
+# RecallController
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RecallResult(PrimitiveResult):
+    """Specialised :class:`PrimitiveResult` for memory recall.
+
+    ``answer`` is the model's prose response. ``n_rows_in_context``
+    is the number of memory rows that were dumped into the prompt at
+    submit time -- useful for the caller to see whether the recall
+    was grounded in any data at all. ``t_call_s`` is the wall time
+    spent waiting on the API (excludes the controller's start-up
+    tick); ``t_elapsed_s`` (inherited) is the total primitive time
+    including aborts/timeouts.
+    """
+
+    question: str = ""
+    answer: str = ""
+    n_rows_in_context: int = 0
+    t_call_s: float = 0.0
+
+
+@dataclass
+class RecallConfig:
+    """Tunable knobs for :class:`RecallController`."""
+
+    call_timeout_s: float = 30.0
+    """Per-call cap on the LLM HTTP request. Flash Lite is fast
+    (~2-5 s typical) but the SDK can stall on cold connections."""
+    overall_timeout_s: float = 45.0
+    """Hard wall-clock cap on the whole primitive."""
+
+
+class RecallController(Controller):
+    """LLM-backed recall over the calling Spot's perception memory.
+
+    Each Spot reasons over only its own observations: we filter
+    ``ctx.memory`` by ``ctx.spot_id`` before formatting the dump.
+    Cross-spot information sharing should go through an explicit
+    "ask another robot" tool rather than leaking through this one.
+
+    State machine (3 phases):
+
+    1. ``init`` -- pull this spot's rows out of ``ctx.memory``, format
+       the dump, build the user prompt, submit to ``on_demand``.
+       Switch to ``wait``.
+    2. ``wait`` -- poll the future every tick. On done: store the
+       answer + elapsed time, switch to ``done``. On per-call timeout:
+       cancel + emit a ``timeout`` result.
+    3. ``done`` -- emit a :class:`RecallResult`.
+
+    The spot does not move during a recall: ``ctx.teleop.drive(0.0)``
+    is issued every tick. Aborts (e.g. via ``X`` hotkey) cancel the
+    pending future and emit an ``aborted`` result.
+    """
+
+    name = "recall"
+
+    _Phase = Literal["init", "wait", "done"]
+
+    def __init__(
+        self,
+        question: str,
+        on_demand: OnDemandRecaller,
+        cfg: Optional[RecallConfig] = None,
+    ) -> None:
+        super().__init__(timeout_s=(cfg.overall_timeout_s if cfg else 45.0))
+        self.question = (question or "").strip()
+        self.on_demand = on_demand
+        self.cfg = cfg if cfg is not None else RecallConfig()
+
+        self._phase: RecallController._Phase = "init"
+        self._future: Optional[_cf.Future] = None
+        self._call_t0: float = 0.0
+        self._answer: str = ""
+        self._n_rows: int = 0
+        self._t_call_s: float = 0.0
+
+    # ----- Controller lifecycle -------------------------------------------
+
+    def status_text(self) -> str:
+        if self._phase == "init":
+            return f"RECALL init"
+        if self._phase == "wait":
+            elapsed = time.monotonic() - self._call_t0
+            return (
+                f"RECALL waiting on LLM ({elapsed:4.1f}s, "
+                f"rows={self._n_rows})"
+            )
+        return f"RECALL done (answer={len(self._answer)} chars)"
+
+    def _build_recall_result(
+        self,
+        ctx: ControllerCtx,
+        status: PrimitiveStatus,
+        reason: str,
+    ) -> RecallResult:
+        ctx.teleop.drive(0.0)
+        if self._future is not None and not self._future.done():
+            self._future.cancel()
+        return RecallResult(
+            primitive=self.name,
+            status=status,
+            reason=reason,
+            t_elapsed_s=self._elapsed(),
+            final_pose=(*ctx.body_xz, ctx.yaw),
+            path_followed=list(self._path_followed),
+            question=self.question,
+            answer=self._answer,
+            n_rows_in_context=self._n_rows,
+            t_call_s=self._t_call_s,
+        )
+
+    def step(
+        self, dt: float, ctx: ControllerCtx
+    ) -> Optional[PrimitiveResult]:
+        if self._t_start is None:
+            self.start(ctx)
+
+        # Hold position regardless of phase.
+        ctx.teleop.drive(0.0)
+
+        if self._aborted is not None:
+            return self._build_recall_result(ctx, "aborted", self._aborted)
+
+        if self._elapsed() >= self.timeout_s:
+            return self._build_recall_result(
+                ctx, "timeout",
+                f"recall exceeded {self.timeout_s:.0f}s wall budget",
+            )
+
+        if self._phase == "init":
+            return self._enter_wait(ctx)
+        if self._phase == "wait":
+            return self._step_wait(ctx)
+        if self._phase == "done":
+            return self._build_recall_result(
+                ctx, "success",
+                f"recall returned {len(self._answer)} chars over "
+                f"{self._n_rows} memory row(s) in {self._t_call_s:.1f}s",
+            )
+        return None
+
+    # ----- helpers --------------------------------------------------------
+
+    def _enter_wait(self, ctx: ControllerCtx) -> Optional[PrimitiveResult]:
+        if ctx.memory is None:
+            return self._build_recall_result(
+                ctx, "unreachable",
+                "recall needs ctx.memory but none was provided",
+            )
+        rows: list[MemoryRow] = list(ctx.memory.filter_by_spot(ctx.spot_id))
+        self._n_rows = len(rows)
+        dump = format_memory_dump(rows)
+        user_prompt = build_recall_user_prompt(self.question, dump)
+        try:
+            self._future = self.on_demand.submit(
+                RECALL_SYSTEM_PROMPT, user_prompt
+            )
+        except Exception as exc:
+            return self._build_recall_result(
+                ctx, "unreachable",
+                f"recall submit raised {type(exc).__name__}: {exc}",
+            )
+        self._call_t0 = time.monotonic()
+        self._phase = "wait"
+        return None
+
+    def _step_wait(self, ctx: ControllerCtx) -> Optional[PrimitiveResult]:
+        assert self._future is not None
+        elapsed = time.monotonic() - self._call_t0
+        if not self._future.done():
+            if elapsed > self.cfg.call_timeout_s:
+                self._future.cancel()
+                self._t_call_s = elapsed
+                return self._build_recall_result(
+                    ctx, "timeout",
+                    f"recall LLM call exceeded "
+                    f"{self.cfg.call_timeout_s:.0f}s",
+                )
+            return None
+        try:
+            self._answer = (self._future.result() or "").strip()
+        except Exception as exc:
+            self._t_call_s = elapsed
+            return self._build_recall_result(
+                ctx, "blocked",
+                f"recall LLM raised {type(exc).__name__}: {exc}",
+            )
+        self._t_call_s = elapsed
         self._phase = "done"
         return None

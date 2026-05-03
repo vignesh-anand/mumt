@@ -1,6 +1,6 @@
 """Append-only perception-memory table for the autonomy harness.
 
-One row per Gemma caption: ``(t, spot_id, sector, room_name, objects,
+One row per multimodal caption: ``(t, spot_id, sector, room_name, objects,
 scene_description)``. Rows are written by background ``CaptionWorker``
 threads (one per Spot) and consumed by the agent loop / HUD on the main
 thread; ``MemoryTable`` is the synchronisation point and the on-disk
@@ -21,7 +21,7 @@ from typing import Iterable, Optional
 
 @dataclass
 class MemoryRow:
-    """One Gemma observation, sector-stamped.
+    """One captioner observation, sector-stamped + pose-stamped.
 
     ``t_sim`` is the in-sim wall time at the moment the frame was
     grabbed (so rows replay against the coverage map correctly even if
@@ -30,12 +30,23 @@ class MemoryRow:
     pipeline latency. ``sector`` is the chess-style coarse-grid label
     of the Spot's body XZ at frame-grab time (e.g. ``"C2"``); ``None``
     if the spot was outside the navmesh AABB.
+
+    ``pose_x``, ``pose_z`` are the body XZ in world metres at frame-
+    grab time. ``pose_yaw_rad`` is the body yaw in radians (same
+    convention as the rest of the codebase: yaw=0 means body forward
+    is along world +X, ``forward(yaw) = (cos yaw, -sin yaw)``). Pose
+    is captured alongside the sector so the agent can recreate the
+    exact viewpoint a caption came from -- richer than sector alone,
+    which is only 5 m precise.
     """
 
     t_sim: float
     t_wall: float
     spot_id: int
     sector: Optional[str]
+    pose_x: float
+    pose_z: float
+    pose_yaw_rad: float
     room_name: str
     objects: list[str]
     scene_description: str

@@ -7,14 +7,17 @@ land:
                      vocabulary (M-Agent.2, slices B + C)
 - ``memory``      -- thread-safe append-only perception-memory table +
                      JSONL persistence (M-Agent.2, slice E)
-- ``perception``  -- per-Spot Gemma 4 caption worker that posts rows
-                     into ``memory`` (M-Agent.2, slice E)
+- ``perception``  -- per-Spot Gemini Flash Lite caption worker that
+                     posts rows into ``memory`` (M-Agent.2, slice E)
 - ``detection``   -- HTTP client + thread-pool wrapper for the Jetson
                      YOLOE server, used by the find-label primitive
                      (M-Agent.2, slice G)
+- ``recall``      -- LLM-backed recall over ``memory`` rows via
+                     Gemini Flash Lite, used by the recall primitive
+                     (M-Agent.2, slice H)
 - ``tools``       -- atomic action primitives (`goto`, `move`,
-                     `search`, `find`) + `Controller` base for
-                     step-able autonomy (M-Agent.2, slice F-G)
+                     `search`, `find`, `recall`) + `Controller` base
+                     for step-able autonomy (M-Agent.2, slice F-H)
 - ``loop``        -- ReAct LLM agent loop (M-Agent.3+)
 """
 
@@ -29,11 +32,18 @@ from .perception import (
     AMBIENT_CAPTION_PROMPT,
     SEARCH_VIEWPOINT_PROMPT,
     CaptionWorker,
-    GemmaClient,
+    GeminiClient,
     OnDemandCaptioner,
     SearchViewpointCaption,
     parse_ambient_caption,
     parse_search_caption,
+)
+from .recall import (
+    RECALL_SYSTEM_PROMPT,
+    OnDemandRecaller,
+    RecallClient,
+    build_recall_user_prompt,
+    format_memory_dump,
 )
 from .tools import (
     Controller,
@@ -47,6 +57,9 @@ from .tools import (
     MoveConfig,
     MoveController,
     PrimitiveResult,
+    RecallConfig,
+    RecallController,
+    RecallResult,
     SearchObservation,
     SearchResult,
     SearchSectorConfig,
@@ -65,12 +78,17 @@ __all__ = [
     "DetectionResponse",
     "OnDemandDetector",
     "YoloeClient",
-    "GemmaClient",
+    "GeminiClient",
     "OnDemandCaptioner",
     "SearchViewpointCaption",
     "parse_ambient_caption",
     "parse_search_caption",
     "CaptionWorker",
+    "RECALL_SYSTEM_PROMPT",
+    "OnDemandRecaller",
+    "RecallClient",
+    "build_recall_user_prompt",
+    "format_memory_dump",
     "Controller",
     "ControllerCtx",
     "FindLabelConfig",
@@ -82,6 +100,9 @@ __all__ = [
     "MoveConfig",
     "MoveController",
     "PrimitiveResult",
+    "RecallConfig",
+    "RecallController",
+    "RecallResult",
     "SearchObservation",
     "SearchResult",
     "SearchSectorConfig",

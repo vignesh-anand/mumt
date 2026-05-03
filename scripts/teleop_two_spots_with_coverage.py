@@ -67,7 +67,8 @@ import habitat_sim
 from mumt_sim.agent.coverage import CoverageMap, CoverageMapConfig
 from mumt_sim.agent.detection import OnDemandDetector, YoloeClient
 from mumt_sim.agent.memory import MemoryTable, default_jsonl_path
-from mumt_sim.agent.perception import CaptionWorker, GemmaClient, OnDemandCaptioner
+from mumt_sim.agent.perception import CaptionWorker, GeminiClient, OnDemandCaptioner
+from mumt_sim.agent.recall import OnDemandRecaller, RecallClient
 from mumt_sim.agent.tools import (
     Controller,
     ControllerCtx,
@@ -76,6 +77,8 @@ from mumt_sim.agent.tools import (
     GotoController,
     MoveController,
     PrimitiveResult,
+    RecallController,
+    RecallResult,
     SearchResult,
     SearchSectorController,
     resolve_goto_target,
@@ -277,39 +280,39 @@ def main() -> None:
         flush=True,
     )
 
-    # ----- Gemma 4 caption workers -------------------------------------
+    # ----- Gemini Flash Lite caption workers ---------------------------
     # One per Spot, 2 Hz. Workers snapshot the latest head-cam RGB,
     # caption it, and append a row to ``memory``. If the Gemini API
     # key is missing we silently skip captioning so the rest of the
-    # rig keeps working.
+    # rig keeps working. Override the model via MUMT_CAPTION_MODEL.
     memory_path = default_jsonl_path()
     memory = MemoryTable(jsonl_path=memory_path)
     print(f"==> memory table -> {memory_path}", flush=True)
     caption_workers: list[Optional[CaptionWorker]] = [None, None]
     on_demand_captioner: Optional[OnDemandCaptioner] = None
     try:
-        gemma_client = GemmaClient(
-            model=os.environ.get("MUMT_GEMMA_MODEL", "gemma-4-26b-a4b-it"),
+        caption_client = GeminiClient(
+            model=os.environ.get("MUMT_CAPTION_MODEL", "gemini-3.1-flash-lite-preview"),
         )
         for spot_id in (0, 1):
             worker = CaptionWorker(
-                spot_id=spot_id, client=gemma_client, memory=memory,
+                spot_id=spot_id, client=caption_client, memory=memory,
                 period_s=2.0,
             )
             worker.start()
             caption_workers[spot_id] = worker
         # Single shared on-demand executor for the search primitive
-        # (and any future primitives that need a synchronous Gemma
+        # (and any future primitives that need a synchronous caption
         # call). Reuses the same client so connection pools are shared.
-        on_demand_captioner = OnDemandCaptioner(gemma_client)
+        on_demand_captioner = OnDemandCaptioner(caption_client)
         print(
-            f"==> Gemma caption workers running (model={gemma_client.model}); "
+            f"==> caption workers running (model={caption_client.model}); "
             f"on-demand captioner ready",
             flush=True,
         )
     except Exception as exc:
         print(
-            f"==> WARNING: Gemma captioning disabled ({exc}). "
+            f"==> WARNING: captioning disabled ({exc}). "
             f"Set GEMINI_API_KEY to enable.",
             flush=True,
         )
@@ -351,6 +354,27 @@ def main() -> None:
             flush=True,
         )
 
+    # Recall (memory-LLM) client. Same model family as the captioner
+    # by default, but kept as a separate client so we can swap in a
+    # heavier reasoning model (e.g. gemini-3.1-pro) for recall without
+    # touching the captioning hot path. Override via MUMT_RECALL_MODEL.
+    on_demand_recaller: Optional[OnDemandRecaller] = None
+    try:
+        recall_client = RecallClient(
+            model=os.environ.get("MUMT_RECALL_MODEL", "gemini-3.1-flash-lite-preview"),
+        )
+        on_demand_recaller = OnDemandRecaller(recall_client, max_workers=2)
+        print(
+            f"==> Recall LLM ready (model={recall_client.model})",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"==> WARNING: Recall LLM disabled ({exc}). "
+            f"Set GEMINI_API_KEY to enable.",
+            flush=True,
+        )
+
     print("==> opening teleop window. WASD drives Spot 0, arrows drive Spot 1.",
           flush=True)
     window = MultiPaneWindow(
@@ -375,10 +399,12 @@ def main() -> None:
     primitive_ctxs: list[ControllerCtx] = [
         ControllerCtx(
             sim=sim, spot_id=0, teleop=teleops[0], coverage=coverage,
+            memory=memory,
             latest_camera_hfov_rad=math.radians(SPOT_HEAD_HFOV_DEG),
         ),
         ControllerCtx(
             sim=sim, spot_id=1, teleop=teleops[1], coverage=coverage,
+            memory=memory,
             latest_camera_hfov_rad=math.radians(SPOT_HEAD_HFOV_DEG),
         ),
     ]
@@ -417,7 +443,7 @@ def main() -> None:
                     f"({vp.x:+.2f}, {vp.z:+.2f}, "
                     f"yaw {math.degrees(vp.yaw_rad):+5.1f}, "
                     f"exp={vp.expected_visible_cells}cells, "
-                    f"gemma={obs.t_caption_s:.1f}s)",
+                    f"cap={obs.t_caption_s:.1f}s)",
                     flush=True,
                 )
                 print(f"      summary: {summary}", flush=True)
@@ -461,6 +487,25 @@ def main() -> None:
                     f"approach_pt ({ax:+.2f},{az:+.2f})",
                     flush=True,
                 )
+        if isinstance(result, RecallResult):
+            print(
+                f"  recall: rows={result.n_rows_in_context}  "
+                f"call_t={result.t_call_s:.1f}s",
+                flush=True,
+            )
+            print(f"  Q: {result.question}", flush=True)
+            # Wrap the answer at ~100 chars per line for readability.
+            ans = (result.answer or "").strip() or "(empty answer)"
+            for raw_line in ans.splitlines() or [ans]:
+                line = raw_line.rstrip()
+                while len(line) > 100:
+                    cut = line.rfind(" ", 0, 100)
+                    if cut <= 0:
+                        cut = 100
+                    print(f"  A: {line[:cut]}", flush=True)
+                    line = line[cut:].lstrip()
+                if line:
+                    print(f"  A: {line}", flush=True)
 
     def _start_primitive(spot_id: int, controller: Controller) -> None:
         existing = active_controllers[spot_id]
@@ -565,12 +610,12 @@ def main() -> None:
                 # sectors. Spot 0 goes to wherever Spot 1 is standing now and
                 # searches that 5x5 m block, and vice-versa. Demonstrates
                 # parallel autonomy: two controllers ticking on the same main
-                # loop, each with its own Gemma planner thread, sharing the
+                # loop, each with its own planner thread, sharing the
                 # single OnDemandCaptioner queue (calls are serialised on its
-                # one worker, which keeps API load smooth).
+                # workers, which keeps API load smooth).
                 if on_demand_captioner is None:
                     print(
-                        "[primitive] search requires Gemma; set GEMINI_API_KEY",
+                        "[primitive] search requires captioner; set GEMINI_API_KEY",
                         flush=True,
                     )
                 else:
@@ -649,6 +694,29 @@ def main() -> None:
                             flush=True,
                         )
 
+            if state.recall_pressed:
+                # Q = LLM recall over the perception memory table on the
+                # ACTIVE spot. Memory is shared between spots so cross-
+                # assignment doesn't help; we run on the active slot so
+                # the user can sequence recall after a search/find tour.
+                # Hardcoded test question for the demo; the real agent
+                # loop will pass arbitrary strings.
+                if on_demand_recaller is None:
+                    print(
+                        "[primitive] recall requires Gemini; "
+                        "set GEMINI_API_KEY",
+                        flush=True,
+                    )
+                else:
+                    q = "When and where did you last see a human?"
+                    _start_primitive(
+                        active_spot, RecallController(q, on_demand_recaller),
+                    )
+                    print(
+                        f"[primitive] spot{active_spot} RECALL: {q!r}",
+                        flush=True,
+                    )
+
             # ----- step each spot: controller or keyboard mapper -----
             for spot_id in (0, 1):
                 ctl = active_controllers[spot_id]
@@ -692,7 +760,11 @@ def main() -> None:
                 # habitat-sim returns RGB; flag rgb_is_bgr=False so the
                 # JPEG encoder swaps channels for cv2.
                 worker.post_observation(
-                    rgb=frame, t_sim=sim_t, sector=sector, rgb_is_bgr=False,
+                    rgb=frame, t_sim=sim_t, sector=sector,
+                    pose_x=float(body_pos.x),
+                    pose_z=float(body_pos.z),
+                    pose_yaw_rad=float(teleops[spot_id].state.yaw),
+                    rgb_is_bgr=False,
                 )
 
             # Coverage update: per-Spot depth back-projection + self-cell stamp.
@@ -756,7 +828,7 @@ def main() -> None:
                     hud.append(f"objs: {objs_str}")
                     hud.append(f"scene: {scene}")
                 else:
-                    hud.append("gemma: (no caption yet)")
+                    hud.append("caption: (none yet)")
                 huds.append(hud)
             huds[0].append(f"{1.0/dt:5.1f} fps   {'BOOST' if state.boost else '     '}")
 
@@ -780,7 +852,8 @@ def main() -> None:
                 f"memory rows: {len(memory)}",
                 f"active=spot{active_spot}   "
                 f"[Tab] swap  [G] goto-other  [M] +1m  [N] +90deg  "
-                f"[F] both-search-other  [H] both-find-human-other  [X] abort",
+                f"[F] both-search-other  [H] both-find-human-other  "
+                f"[Q] recall  [X] abort",
             ]
 
             window.show([
@@ -796,6 +869,8 @@ def main() -> None:
             on_demand_captioner.stop(wait=False)
         if on_demand_detector is not None:
             on_demand_detector.stop(wait=False)
+        if on_demand_recaller is not None:
+            on_demand_recaller.stop(wait=False)
         memory.close()
         window.close()
         sim.close()
