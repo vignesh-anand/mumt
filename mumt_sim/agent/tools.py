@@ -32,6 +32,13 @@ Primitives in this module:
   :class:`RecallResult` with the model's prose answer. Holds no
   motion -- the spot stays put while the call runs.
 
+The long-running primitives (search, find) emit progress callbacks
+through ``Controller.progress_cb``: a small ``dict`` after each
+viewpoint caption (search) or each detection result (find). The
+:mod:`mumt_sim.agent.loop` agent installs these callbacks at submit
+time so the agent can react to mid-flight progress without waiting
+for the primitive to fully finish.
+
 All motion is routed through ``SpotTeleop.drive``, so the navmesh
 clamp, AO push, and HUD pose all stay consistent with the keyboard
 teleop path.
@@ -202,7 +209,16 @@ class Controller(ABC):
     4. (optional) ``abort(reason)`` between ticks to stop early.
 
     Implementations must be cheap to construct and may not block in
-    ``step``."""
+    ``step``.
+
+    ``progress_cb``, if set by the caller before ``start()``, is
+    invoked by long-running controllers at meaningful waypoints
+    (e.g. after each search viewpoint or each detection). The
+    payload is a small ``dict`` with controller-specific keys; the
+    caller is responsible for serialising / forwarding it. Short
+    primitives (``goto``, ``move``, ``recall``) do not emit
+    progress -- the final result is the only event a caller sees.
+    """
 
     name: str = "primitive"
 
@@ -211,6 +227,23 @@ class Controller(ABC):
         self._t_start: Optional[float] = None
         self._aborted: Optional[str] = None
         self._path_followed: list[tuple[float, float]] = []
+        # Optional callback invoked at meaningful junctures (per
+        # subclass) with a small JSON-serialisable payload. The agent
+        # loop uses this to push ToolProgress events back to the LLM
+        # mid-flight; ``None`` means the controller is running in the
+        # legacy hotkey-driven path with no agent listening.
+        self.progress_cb: Optional[Callable[[dict], None]] = None
+
+    def _notify_progress(self, payload: dict) -> None:
+        """Fire-and-forget progress callback. Swallows callback
+        exceptions so a buggy consumer can't kill the controller."""
+        cb = self.progress_cb
+        if cb is None:
+            return
+        try:
+            cb(dict(payload))
+        except Exception:
+            pass
 
     def start(self, ctx: ControllerCtx) -> None:
         self._t_start = time.monotonic()
@@ -1078,6 +1111,7 @@ class SearchSectorController(Controller):
             return
         now = time.monotonic()
         done_idxs: list[int] = []
+        n_planned = len(self._tour)
         for vp_idx, (fut, t0) in self._pending.items():
             elapsed = now - t0
             if fut.done():
@@ -1090,6 +1124,14 @@ class SearchSectorController(Controller):
                         error=None,
                         t_caption_s=elapsed,
                     )
+                    self._notify_progress({
+                        "viewpoint": vp_idx + 1,
+                        "of": n_planned,
+                        "summary": (cap.summary or "").strip()[:140],
+                        "objects": list(cap.objects_of_interest or [])[:6],
+                        "people_visible": int(cap.people_visible or 0),
+                        "anomalies": list(cap.anomalies or [])[:3],
+                    })
                 except Exception as exc:
                     self._observations_by_idx[vp_idx] = SearchObservation(
                         viewpoint=self._tour[vp_idx],
@@ -1098,6 +1140,11 @@ class SearchSectorController(Controller):
                         error=f"caption: {type(exc).__name__}: {exc} "
                               f"(after {elapsed:.1f}s)",
                     )
+                    self._notify_progress({
+                        "viewpoint": vp_idx + 1,
+                        "of": n_planned,
+                        "error": f"caption failed: {type(exc).__name__}",
+                    })
                 done_idxs.append(vp_idx)
             elif elapsed > self.cfg.caption_timeout_s:
                 fut.cancel()
@@ -1108,6 +1155,11 @@ class SearchSectorController(Controller):
                     error=f"caption: timeout after {elapsed:.1f}s "
                           f"(cap={self.cfg.caption_timeout_s:.1f}s)",
                 )
+                self._notify_progress({
+                    "viewpoint": vp_idx + 1,
+                    "of": n_planned,
+                    "error": f"caption timeout after {elapsed:.1f}s",
+                })
                 done_idxs.append(vp_idx)
         for vp_idx in done_idxs:
             self._pending.pop(vp_idx, None)
@@ -1663,6 +1715,10 @@ class FindLabelController(Controller):
         elapsed = time.monotonic() - t0
         if not future.done() and elapsed < self.cfg.detect_timeout_s:
             return None
+        n_planned = len(self._tour)
+        vp_label = (
+            f"{self._idx + 1}/{n_planned}" if n_planned else "?"
+        )
         if not future.done():
             future.cancel()
             self._observations.append(
@@ -1676,6 +1732,11 @@ class FindLabelController(Controller):
             )
             self._n_failed += 1
             self._pending_detect = None
+            self._notify_progress({
+                "detection": False,
+                "viewpoint": vp_label,
+                "error": f"detect timeout {elapsed:.1f}s",
+            })
             return None
 
         # future is done
@@ -1693,6 +1754,11 @@ class FindLabelController(Controller):
                 )
             )
             self._n_failed += 1
+            self._notify_progress({
+                "detection": False,
+                "viewpoint": vp_label,
+                "error": f"detect error {type(exc).__name__}",
+            })
             return None
 
         obs = FindObservation(
@@ -1707,6 +1773,15 @@ class FindLabelController(Controller):
 
         best = response.best_for_label(self.target_label)
         if best is None or best.confidence < float(self.cfg.detect_conf_threshold):
+            self._notify_progress({
+                "detection": False,
+                "viewpoint": vp_label,
+                "label": self.target_label,
+                "n_classes_seen": len(response.detections),
+                "best_conf": (
+                    float(best.confidence) if best is not None else 0.0
+                ),
+            })
             return None
         # Track best-overall regardless of whether we approach on this
         # one (we always commit to the FIRST hit for simplicity).
@@ -1717,6 +1792,13 @@ class FindLabelController(Controller):
             self._best_det = best
             self._best_pose = snap_pose
             self._best_size_wh = response.image_size_wh
+        self._notify_progress({
+            "detection": True,
+            "viewpoint": vp_label,
+            "label": best.label,
+            "confidence": float(best.confidence),
+            "bbox": [int(x) for x in best.xyxy],
+        })
         return (best, snap_pose, response.image_size_wh, snap_depth, snap_hfov)
 
     # ----- approach + centering -------------------------------------------

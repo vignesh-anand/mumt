@@ -18,7 +18,9 @@ land:
 - ``tools``       -- atomic action primitives (`goto`, `move`,
                      `search`, `find`, `recall`) + `Controller` base
                      for step-able autonomy (M-Agent.2, slice F-H)
-- ``loop``        -- ReAct LLM agent loop (M-Agent.3+)
+- ``loop``        -- per-Spot event-driven ReAct agent on top of the
+                     above tools, using Gemini native function calling
+                     (M-Agent.3, slice A)
 """
 
 from .detection import (
@@ -66,6 +68,27 @@ from .tools import (
     SearchSectorController,
     resolve_goto_target,
 )
+from .loop import (
+    AGENT_SYSTEM_PROMPT,
+    AgentClient,
+    AgentEvent,
+    AgentLoop,
+    AgentTraceEntry,
+    EventBus,
+    StdinChatReader,
+    TOOL_NAMES,
+    ToolDispatcher,
+    ToolFailed,
+    ToolProgress,
+    ToolResult,
+    ToolStarted,
+    ToolStopped,
+    UserMessage,
+    format_event_for_llm,
+    format_result_for_llm,
+    format_state_block,
+    parse_thinking_speak,
+)
 from .visibility import Viewpoint, plan_search_tour
 
 __all__ = [
@@ -110,4 +133,24 @@ __all__ = [
     "Viewpoint",
     "plan_search_tour",
     "resolve_goto_target",
+    # loop
+    "AGENT_SYSTEM_PROMPT",
+    "AgentClient",
+    "AgentEvent",
+    "AgentLoop",
+    "AgentTraceEntry",
+    "EventBus",
+    "StdinChatReader",
+    "TOOL_NAMES",
+    "ToolDispatcher",
+    "ToolFailed",
+    "ToolProgress",
+    "ToolResult",
+    "ToolStarted",
+    "ToolStopped",
+    "UserMessage",
+    "format_event_for_llm",
+    "format_result_for_llm",
+    "format_state_block",
+    "parse_thinking_speak",
 ]
