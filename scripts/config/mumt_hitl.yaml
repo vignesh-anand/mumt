@@ -1,0 +1,25 @@
+# @package _global_
+# Hydra config for scripts/mumt_hitl_app.py (Milestone M3c).
+#
+# Mirrors examples/hitl/sim_viewer/config/sim_viewer.yaml's structure but
+# loads our HSSD scene 102344049 and uses the bare-sim driver (no habitat-lab
+# environment / policies, no episode dataset).
+
+defaults:
+  - hitl_defaults
+  - _self_
+
+habitat_hitl:
+  driver: "SimDriver"
+  disable_policies_and_stepping: True
+  # We still hide the humanoid in the GUI viewport because the user is the
+  # humanoid: rendering it would put the back of their own head in front of
+  # the camera. Other clients (future multi-user observer view) will need a
+  # different policy.
+  hide_humanoid_in_gui: True
+  window:
+    title: "Mumt HITL"
+
+mumt:
+  dataset: "data/scene_datasets/hssd-hab/hssd-hab.scene_dataset_config.json"
+  scene: "102344049.scene_instance.json"
