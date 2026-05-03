@@ -539,6 +539,62 @@ class CoverageMap:
         z = self.z_min + (row + 0.5) * coarse_m
         return float(x), float(z)
 
+    def coarse_grid_shape(self) -> tuple[int, int]:
+        """``(n_cols, n_rows)`` of the coarse grid covering the AABB."""
+        coarse_m = float(self.cfg.coarse_cell_m)
+        n_cols = int(math.ceil(self.nx * self.cfg.fine_cell_m / coarse_m))
+        n_rows = int(math.ceil(self.nz * self.cfg.fine_cell_m / coarse_m))
+        return n_cols, n_rows
+
+    def sector_fine_indices(
+        self, label: str
+    ) -> tuple[int, int, int, int]:
+        """Fine-grid AABB of the coarse cell ``label``. Returns
+        ``(ix_min, ix_max, iz_min, iz_max)`` with half-open
+        ``[ix_min, ix_max)`` / ``[iz_min, iz_max)`` intervals,
+        clamped to the fine grid extent. Raises ``ValueError`` on
+        unknown labels."""
+        col, row = self._parse_coarse_label(label)
+        n_cols, n_rows = self.coarse_grid_shape()
+        if not (0 <= col < n_cols and 0 <= row < n_rows):
+            raise ValueError(
+                f"coarse label {label!r} -> ({col}, {row}) is outside "
+                f"the AABB grid of {n_cols} cols x {n_rows} rows"
+            )
+        coarse_m = float(self.cfg.coarse_cell_m)
+        fine_m = float(self.cfg.fine_cell_m)
+        fine_per_coarse = coarse_m / fine_m  # not necessarily integer
+        ix_min = max(0, int(math.floor(col * fine_per_coarse)))
+        ix_max = min(self.nx, int(math.ceil((col + 1) * fine_per_coarse)))
+        iz_min = max(0, int(math.floor(row * fine_per_coarse)))
+        iz_max = min(self.nz, int(math.ceil((row + 1) * fine_per_coarse)))
+        return ix_min, ix_max, iz_min, iz_max
+
+    def neighbour_labels(self, label: str, ring: int = 1) -> list[str]:
+        """Coarse labels of the (2*``ring``+1) x (2*``ring``+1) block
+        of sectors centred on ``label``, including ``label`` itself.
+        Off-grid neighbours are silently dropped, so corner / edge
+        sectors return shorter lists."""
+        col, row = self._parse_coarse_label(label)
+        n_cols, n_rows = self.coarse_grid_shape()
+        out: list[str] = []
+        for r in range(row - ring, row + ring + 1):
+            for c in range(col - ring, col + ring + 1):
+                if 0 <= c < n_cols and 0 <= r < n_rows:
+                    out.append(f"{self._coarse_col_label(c)}{r + 1}")
+        return out
+
+    def region_navigable_mask(self, labels) -> np.ndarray:
+        """Bool mask of shape ``(nz, nx)`` that is True for fine cells
+        which are both navigable AND inside the union of the AABBs of
+        the supplied coarse labels. Useful as a "pose-space" mask for
+        sampling viewpoints inside a 3x3 sector neighbourhood."""
+        region = np.zeros_like(self.is_navigable, dtype=bool)
+        for label in labels:
+            ix_min, ix_max, iz_min, iz_max = self.sector_fine_indices(label)
+            region[iz_min:iz_max, ix_min:ix_max] = True
+        return region & self.is_navigable
+
     def draw_coarse_grid(
         self,
         img: np.ndarray,

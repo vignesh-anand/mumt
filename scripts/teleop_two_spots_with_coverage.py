@@ -66,13 +66,15 @@ import habitat_sim
 
 from mumt_sim.agent.coverage import CoverageMap, CoverageMapConfig
 from mumt_sim.agent.memory import MemoryTable, default_jsonl_path
-from mumt_sim.agent.perception import CaptionWorker, GemmaClient
+from mumt_sim.agent.perception import CaptionWorker, GemmaClient, OnDemandCaptioner
 from mumt_sim.agent.tools import (
     Controller,
     ControllerCtx,
     GotoController,
     MoveController,
     PrimitiveResult,
+    SearchResult,
+    SearchSectorController,
     resolve_goto_target,
 )
 from mumt_sim.agents import add_kinematic_humanoid, add_kinematic_spot
@@ -281,6 +283,7 @@ def main() -> None:
     memory = MemoryTable(jsonl_path=memory_path)
     print(f"==> memory table -> {memory_path}", flush=True)
     caption_workers: list[Optional[CaptionWorker]] = [None, None]
+    on_demand_captioner: Optional[OnDemandCaptioner] = None
     try:
         gemma_client = GemmaClient(
             model=os.environ.get("MUMT_GEMMA_MODEL", "gemma-4-26b-a4b-it"),
@@ -292,8 +295,15 @@ def main() -> None:
             )
             worker.start()
             caption_workers[spot_id] = worker
-        print(f"==> Gemma caption workers running (model={gemma_client.model})",
-              flush=True)
+        # Single shared on-demand executor for the search primitive
+        # (and any future primitives that need a synchronous Gemma
+        # call). Reuses the same client so connection pools are shared.
+        on_demand_captioner = OnDemandCaptioner(gemma_client)
+        print(
+            f"==> Gemma caption workers running (model={gemma_client.model}); "
+            f"on-demand captioner ready",
+            flush=True,
+        )
     except Exception as exc:
         print(
             f"==> WARNING: Gemma captioning disabled ({exc}). "
@@ -338,6 +348,39 @@ def main() -> None:
             f"t={result.t_elapsed_s:.1f}s",
             flush=True,
         )
+        if isinstance(result, SearchResult):
+            for k, obs in enumerate(result.observations):
+                vp = obs.viewpoint
+                if obs.error is not None:
+                    print(
+                        f"  vp{k+1}/{result.n_viewpoints_planned} "
+                        f"({vp.x:+.2f}, {vp.z:+.2f}, "
+                        f"yaw {math.degrees(vp.yaw_rad):+5.1f}): "
+                        f"ERR {obs.error}",
+                        flush=True,
+                    )
+                    continue
+                cap = obs.caption
+                summary = (cap.summary if cap else "").strip()
+                if len(summary) > 90:
+                    summary = summary[:87] + "..."
+                objs = ", ".join((cap.objects_of_interest if cap else [])[:5]) or "-"
+                anoms = "; ".join((cap.anomalies if cap else [])[:3]) or "-"
+                print(
+                    f"  vp{k+1}/{result.n_viewpoints_planned} "
+                    f"({vp.x:+.2f}, {vp.z:+.2f}, "
+                    f"yaw {math.degrees(vp.yaw_rad):+5.1f}, "
+                    f"exp={vp.expected_visible_cells}cells, "
+                    f"gemma={obs.t_caption_s:.1f}s)",
+                    flush=True,
+                )
+                print(f"      summary: {summary}", flush=True)
+                print(
+                    f"      objects: {objs}   "
+                    f"people: {cap.people_visible if cap else 0}   "
+                    f"anomalies: {anoms}",
+                    flush=True,
+                )
 
     def _start_primitive(spot_id: int, controller: Controller) -> None:
         existing = active_controllers[spot_id]
@@ -437,6 +480,48 @@ def main() -> None:
                 _start_primitive(active_spot, MoveController(dyaw_rad=math.pi / 2))
                 print(f"[primitive] spot{active_spot} TURN +90 deg", flush=True)
 
+            if state.search_pressed:
+                # F = both spots simultaneously search each other's current
+                # sectors. Spot 0 goes to wherever Spot 1 is standing now and
+                # searches that 5x5 m block, and vice-versa. Demonstrates
+                # parallel autonomy: two controllers ticking on the same main
+                # loop, each with its own Gemma planner thread, sharing the
+                # single OnDemandCaptioner queue (calls are serialised on its
+                # one worker, which keeps API load smooth).
+                if on_demand_captioner is None:
+                    print(
+                        "[primitive] search requires Gemma; set GEMINI_API_KEY",
+                        flush=True,
+                    )
+                else:
+                    sector_for_spot: list[Optional[str]] = [None, None]
+                    for spot_id in (0, 1):
+                        p = spot_bodies[spot_id].translation
+                        sector_for_spot[spot_id] = (
+                            coverage.coarse_label_for_world_xz(float(p.x), float(p.z))
+                        )
+                    if sector_for_spot[0] is None or sector_for_spot[1] is None:
+                        print(
+                            f"[primitive] SEARCH skipped: spot0 sector="
+                            f"{sector_for_spot[0]}  spot1 sector="
+                            f"{sector_for_spot[1]} (None = outside AABB)",
+                            flush=True,
+                        )
+                    else:
+                        # Cross-assign: each spot searches the OTHER's sector.
+                        for spot_id in (0, 1):
+                            target_label = sector_for_spot[1 - spot_id]
+                            _start_primitive(
+                                spot_id,
+                                SearchSectorController(target_label, on_demand_captioner),
+                            )
+                        print(
+                            f"[primitive] SEARCH parallel: spot0 -> sector "
+                            f"{sector_for_spot[1]}, spot1 -> sector "
+                            f"{sector_for_spot[0]}",
+                            flush=True,
+                        )
+
             # ----- step each spot: controller or keyboard mapper -----
             for spot_id in (0, 1):
                 ctl = active_controllers[spot_id]
@@ -452,6 +537,14 @@ def main() -> None:
             obs = sim.get_sensor_observations(sensor_ids)
             spot0_frame = obs[SPOT_0_HEAD_AGENT_ID][s0_rgb_uuid][:, :, :3]
             spot1_frame = obs[SPOT_1_HEAD_AGENT_ID][s1_rgb_uuid][:, :, :3]
+
+            # Refresh latest_rgb on each ctx so primitives running on the
+            # NEXT tick see this tick's frame (RGB order; Gemma encoder
+            # handles the channel swap).
+            primitive_ctxs[0].latest_rgb = spot0_frame
+            primitive_ctxs[0].latest_rgb_is_bgr = False
+            primitive_ctxs[1].latest_rgb = spot1_frame
+            primitive_ctxs[1].latest_rgb_is_bgr = False
 
             # Hand the latest head-cam frame + sector to each caption
             # worker. Cheap (just stores a reference under a lock); the
@@ -554,7 +647,8 @@ def main() -> None:
                 f"stamped this tick: spot0={cells_stamped[0]}  spot1={cells_stamped[1]}",
                 f"memory rows: {len(memory)}",
                 f"active=spot{active_spot}   "
-                f"[Tab] swap  [G] goto-other  [M] +1m  [N] +90deg  [X] abort",
+                f"[Tab] swap  [G] goto-other  [M] +1m  [N] +90deg  "
+                f"[F] both-search-other  [X] abort",
             ]
 
             window.show([
@@ -566,6 +660,8 @@ def main() -> None:
         for worker in caption_workers:
             if worker is not None:
                 worker.stop(timeout=2.0)
+        if on_demand_captioner is not None:
+            on_demand_captioner.stop(wait=False)
         memory.close()
         window.close()
         sim.close()

@@ -8,7 +8,7 @@ finishes (or fails). This keeps the window responsive, lets two Spots
 run primitives in parallel, and matches the eventual LLM tool-call
 shape: a wrapper can ``start()`` and poll ``step()`` until done.
 
-The two primitives in this module:
+Primitives in this module:
 
 - :class:`GotoController` -- drive the Spot from its current position
   to a goal XZ via a navmesh shortest path, using a pure-pursuit-style
@@ -17,6 +17,10 @@ The two primitives in this module:
   ``dyaw_rad``, then translate by ``(forward_m, lateral_m)`` in the
   new body frame. Useful as both a building block for higher-level
   primitives and a manual "nudge" tool.
+- :class:`SearchSectorController` -- random-sample greedy set-cover
+  viewpoint planner + tour executor. Goes to K viewpoints inside a
+  named sector, asks Gemma a search-tuned caption at each, returns a
+  structured :class:`SearchResult` to the caller.
 
 All motion is routed through ``SpotTeleop.drive``, so the navmesh
 clamp, AO push, and HUD pose all stay consistent with the keyboard
@@ -24,11 +28,12 @@ teleop path.
 """
 from __future__ import annotations
 
+import concurrent.futures as _cf
 import math
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Sequence, Union
+from typing import Any, Callable, Literal, Optional, Sequence, Union
 
 import numpy as np
 
@@ -37,6 +42,13 @@ import habitat_sim
 from mumt_sim.teleop import SpotTeleop
 
 from .coverage import CoverageMap
+from .perception import (
+    SEARCH_VIEWPOINT_PROMPT,
+    OnDemandCaptioner,
+    SearchViewpointCaption,
+    parse_search_caption,
+)
+from .visibility import Viewpoint, plan_search_tour
 
 
 PrimitiveStatus = Literal[
@@ -62,12 +74,24 @@ class PrimitiveResult:
 @dataclass
 class ControllerCtx:
     """Per-tick environment a controller needs to read pose and emit
-    drive commands. Built once per Spot and reused across primitives."""
+    drive commands. Built once per Spot and reused across primitives.
+
+    ``latest_rgb`` is the most recent head-cam frame, refreshed by the
+    main loop each tick. Controllers that need a frame snapshot (e.g.
+    :class:`SearchSectorController` calling Gemma) read it directly.
+    None until the first frame arrives.
+
+    ``latest_rgb_is_bgr`` matches the channel order of the frame above
+    (the teleop loop currently passes RGB straight from habitat-sim,
+    so this defaults to False).
+    """
 
     sim: habitat_sim.Simulator
     spot_id: int
     teleop: SpotTeleop
     coverage: Optional[CoverageMap] = None
+    latest_rgb: Optional[np.ndarray] = None
+    latest_rgb_is_bgr: bool = False
 
     @property
     def body_xz(self) -> tuple[float, float]:
@@ -522,4 +546,410 @@ class MoveController(Controller):
 
         ctx.teleop.drive(dt, forward_mps=v_fwd, lateral_mps=v_lat, yaw_rps=0.0)
         self._record(ctx)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# SearchSectorController
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SearchObservation:
+    """One viewpoint's worth of evidence inside a :class:`SearchResult`.
+
+    ``caption`` is the parsed Gemma response when the on-demand caption
+    succeeded; ``error`` is set instead when goto / face / Gemma all
+    failed for this viewpoint (we still record the viewpoint so the
+    caller sees what the planner intended). Exactly one of ``caption``
+    / ``error`` is set.
+    """
+
+    viewpoint: Viewpoint
+    reached_pose: Optional[tuple[float, float, float]]
+    caption: Optional[SearchViewpointCaption] = None
+    error: Optional[str] = None
+    t_caption_s: float = 0.0
+
+
+@dataclass
+class SearchResult(PrimitiveResult):
+    """Specialised :class:`PrimitiveResult` for sector search.
+
+    Inherits the generic status / reason / final pose, adds the planner
+    output and per-viewpoint observations. Designed to be the structured
+    return value the LLM agent will consume; the human HUD prints a
+    one-line summary per viewpoint.
+    """
+
+    sector: str = ""
+    n_viewpoints_planned: int = 0
+    observations: list[SearchObservation] = field(default_factory=list)
+
+
+@dataclass
+class SearchSectorConfig:
+    """Tunable knobs for :class:`SearchSectorController`. Defaults
+    match the agreed plan."""
+
+    n_positions: int = 100
+    n_headings: int = 12
+    k_max: int = 6
+    min_gain_cells: int = 10
+    hfov_rad: float = math.radians(70.0)
+    max_range_m: float = 5.0
+    n_los_rays: int = 360
+    plan_timeout_s: float = 10.0
+    """Cap on the background plan_search_tour call. The default
+    n_positions=100 typically completes in ~3 s."""
+    caption_timeout_s: float = 20.0
+    """Cap on each per-viewpoint Gemma call; we move on after this.
+    Tuned for Gemma 4 26B which routinely takes 5-15 s per call.
+    NOTE: cancelling a future that has already started running does
+    not abort the underlying HTTP call -- the request continues to
+    consume an OnDemandCaptioner worker until it actually completes.
+    Give the captioner ``max_workers >= 2`` so timed-out calls don't
+    block subsequent submits."""
+    overall_timeout_s: float = 240.0
+    """Hard wall-clock cap on the whole primitive."""
+    settle_after_face_s: float = 0.25
+    """Brief pause after the face-yaw move so the head image stops
+    motion-blurring before we snapshot it for Gemma."""
+
+
+class SearchSectorController(Controller):
+    """Plan + execute a sector search.
+
+    Workflow (state machine):
+
+    1. ``PLANNING`` -- offload :func:`plan_search_tour` to a worker
+       thread (it's ~3 s of numpy on a 100-position sample). Wait
+       non-blockingly via :class:`concurrent.futures.Future`.
+    2. For each planned viewpoint k:
+       a. ``GOTO_K`` -- spawn an internal :class:`GotoController` to
+          ``(vp.x, vp.z)``. On any non-success, record an error for
+          this viewpoint and skip to (a) for k+1.
+       b. ``FACE_K`` -- :class:`MoveController` with ``dyaw =
+          wrap(vp.yaw - current yaw)`` so the head looks the planned
+          way.
+       c. ``SETTLE_K`` -- short pause so the head-cam frame is stable.
+       d. ``CAPTION_K`` -- ``ctx`` exposes the latest RGB; submit it
+          to ``on_demand`` with :data:`SEARCH_VIEWPOINT_PROMPT` +
+          :func:`parse_search_caption`. Store the future.
+       e. ``WAIT_K`` -- poll the future. When ready, append a
+          :class:`SearchObservation` to the result.
+    3. Done -- return a :class:`SearchResult`.
+
+    Errors at any phase do not abort the whole primitive; we record
+    them and move on. Manual abort + the overall timeout do.
+    """
+
+    name = "search"
+
+    _Phase = Literal[
+        "init", "planning", "goto", "face", "settle", "caption", "wait", "done"
+    ]
+
+    def __init__(
+        self,
+        sector: str,
+        on_demand: OnDemandCaptioner,
+        cfg: Optional[SearchSectorConfig] = None,
+    ) -> None:
+        super().__init__(
+            timeout_s=(cfg.overall_timeout_s if cfg else 180.0)
+        )
+        self.sector = str(sector)
+        self.on_demand = on_demand
+        self.cfg = cfg if cfg is not None else SearchSectorConfig()
+
+        self._phase: SearchSectorController._Phase = "init"
+        self._tour: list[Viewpoint] = []
+        self._idx: int = 0
+        self._observations: list[SearchObservation] = []
+        # Background plan_search_tour future and its private executor.
+        self._plan_executor: Optional[_cf.ThreadPoolExecutor] = None
+        self._plan_future: Optional[_cf.Future] = None
+        self._plan_t0: float = 0.0
+        # Inner controllers for goto / face phases.
+        self._goto: Optional[GotoController] = None
+        self._face: Optional[MoveController] = None
+        self._settle_t0: float = 0.0
+        # Caption phase.
+        self._caption_future: Optional[_cf.Future] = None
+        self._caption_t0: float = 0.0
+        # Path log per viewpoint, for debugging.
+        self._reached_pose: Optional[tuple[float, float, float]] = None
+
+    # ----- Controller lifecycle -------------------------------------------
+
+    def status_text(self) -> str:
+        if self._phase == "init":
+            return f"SEARCH {self.sector} init"
+        if self._phase == "planning":
+            elapsed = time.monotonic() - self._plan_t0
+            return f"SEARCH {self.sector} planning ({elapsed:4.1f}s)"
+        if self._phase == "done":
+            return f"SEARCH {self.sector} done ({len(self._observations)} obs)"
+        # k of K
+        kk = f"vp {self._idx + 1}/{len(self._tour)}"
+        sub = self._phase.upper()
+        return f"SEARCH {self.sector} {kk} phase={sub} t={self._elapsed():4.1f}s"
+
+    def _build_result(
+        self,
+        ctx: ControllerCtx,
+        status: PrimitiveStatus,
+        reason: str,
+    ) -> SearchResult:
+        ctx.teleop.drive(0.0)
+        return SearchResult(
+            primitive=self.name,
+            status=status,
+            reason=reason,
+            t_elapsed_s=self._elapsed(),
+            final_pose=(*ctx.body_xz, ctx.yaw),
+            path_followed=list(self._path_followed),
+            sector=self.sector,
+            n_viewpoints_planned=len(self._tour),
+            observations=list(self._observations),
+        )
+
+    # ----- main step ------------------------------------------------------
+
+    def step(
+        self, dt: float, ctx: ControllerCtx
+    ) -> Optional[PrimitiveResult]:
+        if self._t_start is None:
+            self.start(ctx)
+
+        if self._aborted is not None:
+            self._cleanup_executors()
+            return self._build_result(ctx, "aborted", self._aborted)
+
+        if self._elapsed() >= self.timeout_s:
+            self._cleanup_executors()
+            return self._build_result(
+                ctx, "timeout",
+                f"search exceeded {self.timeout_s:.0f}s wall budget",
+            )
+
+        # Dispatch on phase.
+        if self._phase == "init":
+            return self._enter_planning(ctx)
+        if self._phase == "planning":
+            return self._step_planning(ctx)
+        if self._phase == "goto":
+            return self._step_goto(dt, ctx)
+        if self._phase == "face":
+            return self._step_face(dt, ctx)
+        if self._phase == "settle":
+            return self._step_settle(ctx)
+        if self._phase == "caption":
+            return self._step_caption(ctx)
+        if self._phase == "wait":
+            return self._step_wait(ctx)
+        if self._phase == "done":
+            return self._build_result(
+                ctx, "success",
+                f"searched {self.sector}: {len(self._observations)} viewpoints captured",
+            )
+        return None
+
+    # ----- helpers --------------------------------------------------------
+
+    def _cleanup_executors(self) -> None:
+        if self._plan_executor is not None:
+            self._plan_executor.shutdown(wait=False, cancel_futures=True)
+            self._plan_executor = None
+        # Caption futures are owned by self.on_demand; we don't shut it down.
+
+    def _enter_planning(self, ctx: ControllerCtx) -> Optional[PrimitiveResult]:
+        if ctx.coverage is None:
+            return self._build_result(
+                ctx, "unreachable",
+                "search needs ctx.coverage but none was provided",
+            )
+        cov = ctx.coverage
+        # Validate sector label up front so we fail fast on typos.
+        try:
+            cov.sector_fine_indices(self.sector)
+        except ValueError as exc:
+            return self._build_result(
+                ctx, "unreachable", f"unknown sector {self.sector!r}: {exc}",
+            )
+
+        cfg = self.cfg
+        self._plan_executor = _cf.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"SearchPlan-{ctx.spot_id}"
+        )
+        self._plan_t0 = time.monotonic()
+        self._plan_future = self._plan_executor.submit(
+            plan_search_tour,
+            cov,
+            self.sector,
+            n_positions=cfg.n_positions,
+            n_headings=cfg.n_headings,
+            k_max=cfg.k_max,
+            min_gain_cells=cfg.min_gain_cells,
+            hfov_rad=cfg.hfov_rad,
+            max_range_m=cfg.max_range_m,
+            n_los_rays=cfg.n_los_rays,
+        )
+        self._phase = "planning"
+        return None
+
+    def _step_planning(self, ctx: ControllerCtx) -> Optional[PrimitiveResult]:
+        assert self._plan_future is not None
+        if (time.monotonic() - self._plan_t0) > self.cfg.plan_timeout_s:
+            self._cleanup_executors()
+            return self._build_result(
+                ctx, "timeout",
+                f"planning exceeded {self.cfg.plan_timeout_s:.0f}s",
+            )
+        if not self._plan_future.done():
+            return None
+        try:
+            tour = self._plan_future.result()
+        except Exception as exc:
+            self._cleanup_executors()
+            return self._build_result(
+                ctx, "unreachable",
+                f"plan_search_tour raised {type(exc).__name__}: {exc}",
+            )
+        self._cleanup_executors()
+        self._tour = list(tour)
+        self._idx = 0
+        if not self._tour:
+            return self._build_result(
+                ctx, "success",
+                f"sector {self.sector} has no useful viewpoints (empty tour)",
+            )
+        self._phase = "goto"
+        self._goto = GotoController((self._tour[0].x, self._tour[0].z))
+        return None
+
+    def _advance(self) -> None:
+        """Move on to the next viewpoint, or to ``done`` if exhausted."""
+        self._idx += 1
+        self._goto = None
+        self._face = None
+        self._caption_future = None
+        self._reached_pose = None
+        if self._idx >= len(self._tour):
+            self._phase = "done"
+        else:
+            vp = self._tour[self._idx]
+            self._phase = "goto"
+            self._goto = GotoController((vp.x, vp.z))
+
+    def _record_failure(self, reason: str) -> None:
+        vp = self._tour[self._idx]
+        self._observations.append(
+            SearchObservation(
+                viewpoint=vp,
+                reached_pose=self._reached_pose,
+                caption=None,
+                error=reason,
+            )
+        )
+
+    def _step_goto(
+        self, dt: float, ctx: ControllerCtx
+    ) -> Optional[PrimitiveResult]:
+        assert self._goto is not None
+        res = self._goto.step(dt, ctx)
+        if res is None:
+            return None
+        self._reached_pose = (*ctx.body_xz, ctx.yaw)
+        if res.status != "success":
+            self._record_failure(f"goto: {res.status} ({res.reason})")
+            self._advance()
+            return None
+        # Phase transition: face the planned yaw.
+        vp = self._tour[self._idx]
+        dyaw = _wrap_to_pi(vp.yaw_rad - ctx.yaw)
+        self._face = MoveController(dyaw_rad=dyaw)
+        self._phase = "face"
+        return None
+
+    def _step_face(
+        self, dt: float, ctx: ControllerCtx
+    ) -> Optional[PrimitiveResult]:
+        assert self._face is not None
+        res = self._face.step(dt, ctx)
+        if res is None:
+            return None
+        self._reached_pose = (*ctx.body_xz, ctx.yaw)
+        if res.status not in ("success", "timeout"):
+            # Non-success but also not catastrophic: record and skip.
+            self._record_failure(f"face: {res.status} ({res.reason})")
+            self._advance()
+            return None
+        self._settle_t0 = time.monotonic()
+        self._phase = "settle"
+        return None
+
+    def _step_settle(self, ctx: ControllerCtx) -> Optional[PrimitiveResult]:
+        if (time.monotonic() - self._settle_t0) < self.cfg.settle_after_face_s:
+            ctx.teleop.drive(0.0)
+            return None
+        self._phase = "caption"
+        return None
+
+    def _step_caption(self, ctx: ControllerCtx) -> Optional[PrimitiveResult]:
+        ctx.teleop.drive(0.0)
+        if ctx.latest_rgb is None:
+            self._record_failure("caption: no RGB frame available on ctx")
+            self._advance()
+            return None
+        # Hand the live frame straight to Gemma. The teleop loop allocs
+        # a fresh ndarray per tick so it's safe to reference.
+        self._caption_future = self.on_demand.submit(
+            ctx.latest_rgb,
+            SEARCH_VIEWPOINT_PROMPT,
+            parse_search_caption,
+            rgb_is_bgr=ctx.latest_rgb_is_bgr,
+        )
+        self._caption_t0 = time.monotonic()
+        self._phase = "wait"
+        return None
+
+    def _step_wait(self, ctx: ControllerCtx) -> Optional[PrimitiveResult]:
+        ctx.teleop.drive(0.0)
+        assert self._caption_future is not None
+        elapsed = time.monotonic() - self._caption_t0
+        if elapsed > self.cfg.caption_timeout_s:
+            # Best-effort: only succeeds if the call hasn't started yet.
+            # If it has, the call keeps running on its own worker and
+            # the result is discarded when it eventually completes.
+            self._caption_future.cancel()
+            self._record_failure(
+                f"caption: timeout after {elapsed:.1f}s "
+                f"(cap={self.cfg.caption_timeout_s:.1f}s)",
+            )
+            self._advance()
+            return None
+        if not self._caption_future.done():
+            return None
+        try:
+            cap = self._caption_future.result()
+        except Exception as exc:
+            self._record_failure(
+                f"caption: {type(exc).__name__}: {exc} "
+                f"(after {elapsed:.1f}s)",
+            )
+            self._advance()
+            return None
+        vp = self._tour[self._idx]
+        self._observations.append(
+            SearchObservation(
+                viewpoint=vp,
+                reached_pose=self._reached_pose,
+                caption=cap,
+                error=None,
+                t_caption_s=time.monotonic() - self._caption_t0,
+            )
+        )
+        self._advance()
         return None

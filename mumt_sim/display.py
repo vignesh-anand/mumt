@@ -42,14 +42,14 @@ from pynput import keyboard
 #   plus R as edge for reset).
 # - "primitive trigger" letters fire edge-only events for autonomous tools:
 #   G = goto, M = move forward, N = turn (90 deg left), X = abort current
-#   primitive on the active Spot.
-_LETTER_KEYS = {"w", "s", "a", "d", "r", "g", "m", "n", "x"}
+#   primitive on the active Spot, F = search the active Spot's current sector.
+_LETTER_KEYS = {"w", "s", "a", "d", "r", "g", "m", "n", "x", "f"}
 _NAV_KEYS = {"up", "down", "left", "right"}
 _MOD_KEYS = {"shift"}
 
 # Edge-triggered letter keys: rising edge produces a one-shot event,
 # the held set still tracks them so we can debounce.
-_EDGE_LETTERS = {"r", "g", "m", "n", "x"}
+_EDGE_LETTERS = {"r", "g", "m", "n", "x", "f"}
 
 
 @dataclass
@@ -73,6 +73,7 @@ class InputState:
     move_pressed: bool = False           # M  (drive 1 m forward on active spot)
     turn_pressed: bool = False           # N  (turn 90 deg CCW on active spot)
     abort_pressed: bool = False          # X  (abort active spot's primitive)
+    search_pressed: bool = False         # F  (search active spot's current sector)
 
 
 class _PynputTracker:
@@ -91,6 +92,7 @@ class _PynputTracker:
         "m": "move",
         "n": "turn",
         "x": "abort",
+        "f": "search",
     }
 
     def __init__(self) -> None:
@@ -104,6 +106,7 @@ class _PynputTracker:
             "move": False,
             "turn": False,
             "abort": False,
+            "search": False,
         }
         self._listener = keyboard.Listener(
             on_press=self._on_press, on_release=self._on_release
@@ -164,7 +167,7 @@ class _PynputTracker:
         """Return ``(held_keys_copy, edges)`` and clear the edges. The
         ``edges`` dict has one key per named edge:
         ``reset``, ``switch``, ``quit``, ``goto``, ``move``, ``turn``,
-        ``abort``."""
+        ``abort``, ``search``."""
         with self._lock:
             held = set(self._held)
             edges = dict(self._edges)
@@ -290,6 +293,7 @@ class SplitScreenWindow:
             move_pressed=edges["move"],
             turn_pressed=edges["turn"],
             abort_pressed=edges["abort"],
+            search_pressed=edges["search"],
         )
 
     def should_close(self) -> bool:
@@ -483,6 +487,7 @@ class MultiPaneWindow:
             move_pressed=edges["move"],
             turn_pressed=edges["turn"],
             abort_pressed=edges["abort"],
+            search_pressed=edges["search"],
         )
 
     def should_close(self) -> bool:

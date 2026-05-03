@@ -16,7 +16,16 @@ land:
 """
 
 from .memory import MemoryRow, MemoryTable, default_jsonl_path
-from .perception import CaptionWorker, GemmaClient
+from .perception import (
+    AMBIENT_CAPTION_PROMPT,
+    SEARCH_VIEWPOINT_PROMPT,
+    CaptionWorker,
+    GemmaClient,
+    OnDemandCaptioner,
+    SearchViewpointCaption,
+    parse_ambient_caption,
+    parse_search_caption,
+)
 from .tools import (
     Controller,
     ControllerCtx,
@@ -25,14 +34,25 @@ from .tools import (
     MoveConfig,
     MoveController,
     PrimitiveResult,
+    SearchObservation,
+    SearchResult,
+    SearchSectorConfig,
+    SearchSectorController,
     resolve_goto_target,
 )
+from .visibility import Viewpoint, plan_search_tour
 
 __all__ = [
     "MemoryRow",
     "MemoryTable",
     "default_jsonl_path",
+    "AMBIENT_CAPTION_PROMPT",
+    "SEARCH_VIEWPOINT_PROMPT",
     "GemmaClient",
+    "OnDemandCaptioner",
+    "SearchViewpointCaption",
+    "parse_ambient_caption",
+    "parse_search_caption",
     "CaptionWorker",
     "Controller",
     "ControllerCtx",
@@ -41,5 +61,11 @@ __all__ = [
     "MoveConfig",
     "MoveController",
     "PrimitiveResult",
+    "SearchObservation",
+    "SearchResult",
+    "SearchSectorConfig",
+    "SearchSectorController",
+    "Viewpoint",
+    "plan_search_tour",
     "resolve_goto_target",
 ]
