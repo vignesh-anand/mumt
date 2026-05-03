@@ -19,9 +19,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-PY=python3.10
+# NOTE: the asset-processing venv intentionally targets Python 3.11, NOT the
+# 3.10 used by the rest of the project. The magnum-tools binary artifact from
+# github.com/mosra/magnum-ci dropped Python 3.10 bindings in Feb 2026
+# (see commit titled "Welp, can't have Python 3.10 anymore.") and now ships
+# only 3.11 + 3.12 .so files. Our main .venv stays on 3.10 because that is
+# what habitat-sim was built against.
+PY=python3.11
 if ! command -v "$PY" >/dev/null 2>&1; then
-    echo "ERROR: $PY not found. The system Python 3.10 is required." >&2
+    echo "ERROR: $PY not found. Install with: sudo apt install python3.11 python3.11-venv" >&2
     exit 1
 fi
 
@@ -34,7 +40,7 @@ else
     echo "    already cloned"
 fi
 
-echo "==> creating .venv-magnum (Python 3.10) for the asset processor"
+echo "==> creating .venv-magnum (Python 3.11) for the asset processor"
 if [ ! -d .venv-magnum ]; then
     "$PY" -m venv .venv-magnum
     .venv-magnum/bin/pip install --upgrade pip wheel >/dev/null

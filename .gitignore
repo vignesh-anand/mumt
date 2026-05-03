@@ -11,6 +11,9 @@ data/
 # render outputs
 renders/
 
+# M3b asset-bake intermediate output (huge, regenerated from data/ + magnum-tools)
+_data_processing_output/
+
 # python
 __pycache__/
 *.pyc

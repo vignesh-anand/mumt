@@ -13,9 +13,11 @@ Eventual VR embodiment of the human via Habitat-HITL.
 - **M2b/c (planned):** autonomous geodesic-follower Spots, SMPL-X walking humanoid.
 - **M3a (done):** habitat-hitl runtime stack validation - Unity Editor
   on Linux acts as the VR client over localhost. No headset yet.
-- **M3b/c (planned):** sideload Unity client APK to Quest 2 over USB-tether,
-  then a custom mumt HITL app with embodied human + VR-driven Spot teleop +
-  floating HUD panels.
+- **M3b (done):** Quest 2 sideload of the same Unity client. HSSD scene
+  102344049 streams from a desktop habitat-hitl server over USB-tether and
+  renders inside the headset, head-tracked.
+- **M3c (planned):** custom mumt HITL app with embodied human + VR-driven
+  Spot teleop + floating HUD panels.
 
 See `/home/vignesh/.cursor/plans/` for the live planning docs and the
 [Milestones](#milestones) section below for the running technical journal.
@@ -40,7 +42,9 @@ mumt/
     02_fetch_assets.sh                # hf login + dataset_downloader + hf download
     03_install_unity_hub.sh           # M3a.1: apt install unityhub (sudo)
     04_install_vr_assets.sh           # M3a.2: clone unity client + magnum env
+    05_process_unity_data.sh          # M3b.1: bake HSSD scene into Unity GLBs
     06_run_sim_viewer_server.sh       # M3a.3: run habitat-hitl server on :8888
+    process_unity_hssd.py             # M3b.1: dataset processing config
     render_two_spots_one_human.py     # M1 deliverable
     teleop_spot.py                    # M2a deliverable
   renders/                            # output PNGs (gitignored)
@@ -387,7 +391,142 @@ To stop: Ctrl-C the server, then click ▶ in Unity to exit Play.
 - ``scripts/04_install_vr_assets.sh`` already creates ``.venv-magnum`` and
   the ``habitat_dataset_processing`` install, so M3b only needs the manual
   ``magnum-tools`` artifact download + a wrapper around ``unity_dataset_processing.py``.
-- No headset / APK build yet (M3b).
 - No custom HITL app yet; ``sim_viewer`` is used unmodified at M3a.3 (M3c).
 - No automation of the Unity Hub login or editor install - the Unity Hub GUI
   has no headless install mode that doesn't require a Unity account login.
+
+### M3b - Quest 2 sideload + USB-tethered VR
+
+**Goal:** sideload the same Unity client used in M3a onto a Quest 2 over USB,
+have it stream the same HSSD scene 102344049 from a desktop habitat-hitl
+server, render the scene head-tracked inside the headset.
+
+**Deliverable / how to run:**
+
+One-time prereqs (see Problems-and-fixes for what to do when each step fails):
+
+```bash
+# Headset side: enable Developer Mode through Meta Horizon mobile app after
+# creating a free developer organization at developers.meta.com/horizon/manage.
+# Then on Linux, install adb:
+sudo apt install -y android-tools-adb
+
+# Asset side: download the magnum-tools artifact (~24 MB zip) from
+# github.com/mosra/magnum-ci/actions/workflows/magnum-tools.yml and extract:
+#   third_party/magnum-tools/linux-x64/{bin,include,lib,python}/...
+# Then re-run scripts/04_install_vr_assets.sh; expect "OK".
+bash scripts/04_install_vr_assets.sh
+
+# Bake HSSD scene 102344049 into Unity-friendly geometry under
+# _data_processing_output/data/. Fast (~15 s) because 02_fetch_assets.sh
+# already pruned downloads to only what scene 102344049 references.
+bash scripts/05_process_unity_data.sh
+```
+
+In Unity Editor (manual, one-time per asset bake):
+
+1. ``Tools > Update Data Folder...``, paste
+   ``/home/vignesh/mumt/_data_processing_output/data`` as External Data Path,
+   click ``Update Data Folder``. Wait for AssetDatabase reimport.
+2. ``File > Build Settings > Android > Switch Platform`` (multi-minute reimport).
+3. ``Player Settings > XR Plug-in Management > Android tab > tick Oculus``.
+4. ``Player Settings > Player > Android tab > Other Settings``:
+   * Package Name: ``com.mumt.hitlclient``
+   * Minimum API Level: 29 (Quest 2 baseline)
+   * Scripting Backend: IL2CPP
+   * Target Architectures: ARM64 only
+5. ``Build Settings > Build`` -> ``Build/mumt_hitl_client.apk`` (~39 MB).
+
+Sideload + run (every session, after the editor work):
+
+```bash
+adb install -r third_party/siro_hitl_unity_client/Build/mumt_hitl_client.apk
+
+# TCP-over-USB: Quest's localhost:8888 -> our Linux box's :8888
+adb reverse tcp:8888 tcp:8888
+
+# Server (leave running)
+bash scripts/06_run_sim_viewer_server.sh
+```
+
+Then put the headset on, open the **Apps** library, switch the category
+dropdown to **Unknown Sources**, launch the sideloaded app. The HSSD scene
+streams in head-tracked.
+
+**Conventions established here:**
+
+- ``.venv-magnum`` is **Python 3.11**, not 3.10. The ``magnum-tools`` artifact
+  from ``mosra/magnum-ci`` dropped Python 3.10 wheels in Feb 2026; the latest
+  artifacts only ship ``cpython-311`` and ``cpython-312`` ``.so`` files. The
+  main project venv stays on 3.10 because that is what habitat-sim was built
+  against. Two coexisting venvs is the simplest fix.
+- ``adb reverse tcp:8888 tcp:8888`` is the canonical bridge. The Unity client
+  hard-codes ``ws://127.0.0.1:8888`` in ``NetworkClient.cs``. Inside the Quest
+  ``127.0.0.1`` resolves to the headset itself, so the reverse-tunnel is
+  load-bearing - **every Quest reboot or USB replug clears it** and you need
+  to re-run the command.
+- ``scripts/process_unity_hssd.py`` whitelists scene ``102344049`` only and
+  uses the (non-articulated) ``hssd-hab.scene_dataset_config.json`` we already
+  have on disk. Future scenes go through the same script with an extra
+  whitelist entry.
+- The Unity APK build target is **Android API 29 + ARM64-only + IL2CPP** and
+  uses the ``Oculus`` XR provider (not ``OpenXR``). Picking exactly one
+  provider matters; ticking both creates a runtime conflict.
+
+**Problems hit and how we solved them:**
+
+- magnum-tools GitHub Actions artifact won't download just by clicking;
+  GitHub gates artifacts behind a logged-in account
+  -> any free GitHub login works; the page silently shows only the SHA256
+     instead of a download link when you're logged out. Find the latest
+     successful run of ``magnum-tools.yml``, log in, click the artifact name
+     (not the hash).
+- The artifact extracts to ``magnum-tools-...-linux-x64/{bin,include,lib,python}``
+  with no extra wrapper directory; ``scripts/04_install_vr_assets.sh`` expects
+  ``third_party/magnum-tools/linux-x64/python/...``
+  -> ``mv ~/Downloads/magnum-tools-*-linux-x64 third_party/magnum-tools/linux-x64``
+     puts it where the script expects.
+- magnum-tools ``.so`` files are ``cpython-311``/``312``, but
+  ``scripts/04_install_vr_assets.sh`` originally created the venv with
+  ``python3.10``. ``import magnum`` failed with ``No module named '_corrade'``
+  -> hard-pinned ``PY=python3.11`` in ``scripts/04_install_vr_assets.sh`` with
+     a comment explaining why. Ubuntu 22.04 already ships ``/usr/bin/python3.11``,
+     no extra apt install needed.
+- Unity ``Tools > Update Data Folder`` reimport produced **328
+  ``ArgumentNullException: shader``** errors at first
+  -> root cause: the project is on URP, the ``GLTFUtility`` package's URP
+     ``.shadergraph`` files exist but are not visible to import-worker
+     processes during batch import. Mitigations applied in order:
+     - Set ``Edit > Preferences > Asset Pipeline > Import Worker Count %``
+       from ``25`` to ``0`` (single-process import). Cut errors to ~170.
+     - Force-compile the four GLTFUtility URP shadergraphs by double-clicking
+       them so they recompile on the main thread, then ``Reimport`` the data
+       folder. No further reduction (still ~170).
+     - **Punted** the remaining 170 furniture imports for now. The
+       ``stages/102344049.glb`` (the entire HSSD shell) imported correctly
+       and is what gets seen in VR; objects/furniture are missing but not
+       fatal. Tracked as M3b open-issue below.
+- (Known-issue, not yet fixed): **head tracking yaw/pitch axis convention is
+  off**. Looking in a direction and physically turning the head produce
+  inconsistent scene rotation, suggesting a coordinate-frame mismatch
+  between the Quest's XR pose and what ``sim_viewer`` expects (Habitat is +Y
+  up and right-handed; Unity is +Y up and left-handed; the Quest's XR
+  reference frame may need an extra basis change in
+  ``CoordinateSystem.cs``). Triage moves to early M3c.
+
+**What we deliberately punted:**
+
+- The 170 missing furniture imports. The
+  ``GLTFUtility/URP/Standard (Metallic)`` shadergraph being invisible to
+  import workers is a real Unity 2022 / URP 14 / GLTFUtility issue; the next
+  attempt will be either a one-off ``Reimport All`` after a project restart
+  with import workers disabled, or an editor pre-warm script that calls
+  ``Shader.Find`` + ``ShaderUtil.CompilePass`` on each GLTFUtility shadergraph
+  before running ``AssetDatabase.ImportAsset`` on the GLB folder.
+- Quest controllers / hand interaction. The default sideloaded client uses
+  the bundled ``XR Device Simulator`` controllers, which work but aren't
+  wired into our scene. M3c.
+- HUD panels, embodied human, Spot teleop from VR. All M3c.
+- Lighting on the streamed HSSD stage. The stage GLB has no baked lights, so
+  the VR scene is dim. M3c will either ship a light pass through
+  ``sim_viewer`` config or place Unity-side lights into the ``PlayerVR`` scene.
