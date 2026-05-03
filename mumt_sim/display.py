@@ -36,9 +36,20 @@ from pynput import keyboard
 # Canonical names the rest of the module uses to talk about keys.
 # We normalise ``pynput`` events into this small string vocabulary so we don't
 # leak ``pynput.Key.*`` symbols out of this file.
-_LETTER_KEYS = {"w", "s", "a", "d", "r"}
+#
+# Letter keys split into two groups:
+# - "held" letters drive continuous teleop axes (W/S/A/D for forward/yaw,
+#   plus R as edge for reset).
+# - "primitive trigger" letters fire edge-only events for autonomous tools:
+#   G = goto, M = move forward, N = turn (90 deg left), X = abort current
+#   primitive on the active Spot.
+_LETTER_KEYS = {"w", "s", "a", "d", "r", "g", "m", "n", "x"}
 _NAV_KEYS = {"up", "down", "left", "right"}
 _MOD_KEYS = {"shift"}
+
+# Edge-triggered letter keys: rising edge produces a one-shot event,
+# the held set still tracks them so we can debounce.
+_EDGE_LETTERS = {"r", "g", "m", "n", "x"}
 
 
 @dataclass
@@ -54,9 +65,14 @@ class InputState:
     tilt_up: bool = False
     tilt_down: bool = False
     boost: bool = False
-    reset_pressed: bool = False         # edge-triggered (rising edge of R)
+    reset_pressed: bool = False          # edge-triggered (rising edge of R)
     switch_active_pressed: bool = False  # edge-triggered (rising edge of Tab)
-    quit_pressed: bool = False          # Esc edge or window close
+    quit_pressed: bool = False           # Esc edge or window close
+    # Primitive triggers (rising edge):
+    goto_pressed: bool = False           # G
+    move_pressed: bool = False           # M  (drive 1 m forward on active spot)
+    turn_pressed: bool = False           # N  (turn 90 deg CCW on active spot)
+    abort_pressed: bool = False          # X  (abort active spot's primitive)
 
 
 class _PynputTracker:
@@ -67,12 +83,28 @@ class _PynputTracker:
     edge-triggered events for R (reset) and Esc (quit).
     """
 
+    # Map "edge letter" name -> InputState field name. Keeps the
+    # tracker generic over which letters fire edges.
+    _EDGE_FIELDS = {
+        "r": "reset",
+        "g": "goto",
+        "m": "move",
+        "n": "turn",
+        "x": "abort",
+    }
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._held: set[str] = set()
-        self._reset_edge = False
-        self._switch_edge = False
-        self._quit_edge = False
+        self._edges: dict[str, bool] = {
+            "reset": False,
+            "switch": False,
+            "quit": False,
+            "goto": False,
+            "move": False,
+            "turn": False,
+            "abort": False,
+        }
         self._listener = keyboard.Listener(
             on_press=self._on_press, on_release=self._on_release
         )
@@ -112,12 +144,13 @@ class _PynputTracker:
             return
         with self._lock:
             if name == "esc":
-                self._quit_edge = True
+                self._edges["quit"] = True
                 return
-            if name == "r" and "r" not in self._held:
-                self._reset_edge = True
             if name == "tab" and "tab" not in self._held:
-                self._switch_edge = True
+                self._edges["switch"] = True
+            edge_field = self._EDGE_FIELDS.get(name)
+            if edge_field is not None and name not in self._held:
+                self._edges[edge_field] = True
             self._held.add(name)
 
     def _on_release(self, key) -> None:
@@ -127,17 +160,17 @@ class _PynputTracker:
         with self._lock:
             self._held.discard(name)
 
-    def snapshot(self) -> tuple[set[str], bool, bool, bool]:
-        """Return (held_keys_copy, reset_edge, switch_edge, quit_edge), clearing edges."""
+    def snapshot(self) -> tuple[set[str], dict[str, bool]]:
+        """Return ``(held_keys_copy, edges)`` and clear the edges. The
+        ``edges`` dict has one key per named edge:
+        ``reset``, ``switch``, ``quit``, ``goto``, ``move``, ``turn``,
+        ``abort``."""
         with self._lock:
             held = set(self._held)
-            reset_edge = self._reset_edge
-            switch_edge = self._switch_edge
-            quit_edge = self._quit_edge
-            self._reset_edge = False
-            self._switch_edge = False
-            self._quit_edge = False
-        return held, reset_edge, switch_edge, quit_edge
+            edges = dict(self._edges)
+            for k in self._edges:
+                self._edges[k] = False
+        return held, edges
 
     def stop(self) -> None:
         try:
@@ -236,8 +269,8 @@ class SplitScreenWindow:
         if visible < 1.0:
             self._closed = True
 
-        held, reset_edge, switch_edge, quit_edge = self._tracker.snapshot()
-        if quit_edge:
+        held, edges = self._tracker.snapshot()
+        if edges["quit"]:
             self._closed = True
 
         return InputState(
@@ -250,9 +283,13 @@ class SplitScreenWindow:
             tilt_up="up" in held,
             tilt_down="down" in held,
             boost="shift" in held,
-            reset_pressed=reset_edge,
-            switch_active_pressed=switch_edge,
+            reset_pressed=edges["reset"],
+            switch_active_pressed=edges["switch"],
             quit_pressed=self._closed,
+            goto_pressed=edges["goto"],
+            move_pressed=edges["move"],
+            turn_pressed=edges["turn"],
+            abort_pressed=edges["abort"],
         )
 
     def should_close(self) -> bool:
@@ -425,8 +462,8 @@ class MultiPaneWindow:
         if visible < 1.0:
             self._closed = True
 
-        held, reset_edge, switch_edge, quit_edge = self._tracker.snapshot()
-        if quit_edge:
+        held, edges = self._tracker.snapshot()
+        if edges["quit"]:
             self._closed = True
 
         return InputState(
@@ -439,9 +476,13 @@ class MultiPaneWindow:
             tilt_up="up" in held,
             tilt_down="down" in held,
             boost="shift" in held,
-            reset_pressed=reset_edge,
-            switch_active_pressed=switch_edge,
+            reset_pressed=edges["reset"],
+            switch_active_pressed=edges["switch"],
             quit_pressed=self._closed,
+            goto_pressed=edges["goto"],
+            move_pressed=edges["move"],
+            turn_pressed=edges["turn"],
+            abort_pressed=edges["abort"],
         )
 
     def should_close(self) -> bool:

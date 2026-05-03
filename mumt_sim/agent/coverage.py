@@ -497,6 +497,48 @@ class CoverageMap:
             return None
         return f"{self._coarse_col_label(col)}{row + 1}"
 
+    @staticmethod
+    def _parse_coarse_label(label: str) -> tuple[int, int]:
+        """Reverse of ``_coarse_col_label`` + the row suffix. Returns
+        ``(col, row)`` (zero-based). Raises ``ValueError`` on garbage."""
+        s = str(label).strip().upper()
+        if not s:
+            raise ValueError("empty coarse label")
+        i = 0
+        while i < len(s) and s[i].isalpha():
+            i += 1
+        letters, digits = s[:i], s[i:]
+        if not letters or not digits or not digits.isdigit():
+            raise ValueError(
+                f"coarse label {label!r} must look like 'C7' (letters + digits)"
+            )
+        col = 0
+        for ch in letters:
+            col = col * 26 + (ord(ch) - ord("A") + 1)
+        col -= 1
+        row = int(digits) - 1
+        if col < 0 or row < 0:
+            raise ValueError(f"coarse label {label!r} parses to negative index")
+        return col, row
+
+    def world_xz_for_coarse_label(self, label: str) -> tuple[float, float]:
+        """World ``(x, z)`` of the centre of the coarse cell named by
+        ``label`` (e.g. ``"C7"``). Inverse of
+        :meth:`coarse_label_for_world_xz`. Raises ``ValueError`` if the
+        label is malformed or refers to a cell outside the AABB."""
+        col, row = self._parse_coarse_label(label)
+        coarse_m = float(self.cfg.coarse_cell_m)
+        n_cols = int(math.ceil(self.nx * self.cfg.fine_cell_m / coarse_m))
+        n_rows = int(math.ceil(self.nz * self.cfg.fine_cell_m / coarse_m))
+        if not (0 <= col < n_cols and 0 <= row < n_rows):
+            raise ValueError(
+                f"coarse label {label!r} -> ({col}, {row}) is outside the "
+                f"AABB grid of {n_cols} cols x {n_rows} rows"
+            )
+        x = self.x_min + (col + 0.5) * coarse_m
+        z = self.z_min + (row + 0.5) * coarse_m
+        return float(x), float(z)
+
     def draw_coarse_grid(
         self,
         img: np.ndarray,

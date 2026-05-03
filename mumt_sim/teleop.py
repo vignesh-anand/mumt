@@ -125,7 +125,11 @@ class SpotTeleop:
         self._push()
 
     def step(self, dt: float, controls: TeleopInput) -> None:
-        """Integrate one frame of input and write the result into habitat-sim."""
+        """Integrate one frame of keyboard input and write the result into
+        habitat-sim. Thin wrapper that converts the boolean axes of
+        ``TeleopInput`` into continuous velocities and delegates to
+        :meth:`drive` (plus the pan/tilt + reset handling that is
+        keyboard-specific)."""
         if controls.reset:
             self.reset()
             return
@@ -135,37 +139,83 @@ class SpotTeleop:
 
         boost = self.params.boost_factor if controls.boost else 1.0
 
-        # 1) Body XZ translation, clamped against the navmesh.
         forward_axis = (1.0 if controls.forward else 0.0) - (1.0 if controls.backward else 0.0)
-        if forward_axis != 0.0:
-            speed = self.params.forward_speed * boost * forward_axis
-            cy = math.cos(self.state.yaw)
-            sy = math.sin(self.state.yaw)
-            # Body +X in world coordinates after a +Y yaw (right-handed):
-            #   R_y(yaw) * (1, 0, 0) = (cos yaw, 0, -sin yaw).
-            forward_world = mn.Vector3(cy, 0.0, -sy)
-            attempted = self.state.position + forward_world * (speed * dt)
-            self.state.position = mn.Vector3(
-                self.sim.pathfinder.try_step(self.state.position, attempted)
-            )
-
-        # 2) Yaw (no navmesh constraint).
         yaw_axis = (1.0 if controls.yaw_left else 0.0) - (1.0 if controls.yaw_right else 0.0)
-        if yaw_axis != 0.0:
-            self.state.yaw += self.params.yaw_rate * boost * yaw_axis * dt
+        forward_mps = self.params.forward_speed * boost * forward_axis
+        yaw_rps = self.params.yaw_rate * boost * yaw_axis
 
-        # 3) Pan (free, wraps).
+        # Body XZ translation + yaw (delegated to the continuous-command
+        # path so primitives and keyboard share one motion model).
+        self.drive(
+            dt,
+            forward_mps=forward_mps,
+            lateral_mps=0.0,
+            yaw_rps=yaw_rps,
+            push=False,
+        )
+
+        # Pan (free, wraps).
         pan_axis = (1.0 if controls.pan_left else 0.0) - (1.0 if controls.pan_right else 0.0)
         if pan_axis != 0.0:
             self.state.pan += self.params.pan_rate * pan_axis * dt
 
-        # 4) Tilt (clamped).
+        # Tilt (clamped).
         tilt_axis = (1.0 if controls.tilt_up else 0.0) - (1.0 if controls.tilt_down else 0.0)
         if tilt_axis != 0.0:
             new_tilt = self.state.tilt + self.params.tilt_rate * tilt_axis * dt
             self.state.tilt = max(self.params.tilt_min, min(self.params.tilt_max, new_tilt))
 
         self._push()
+
+    def drive(
+        self,
+        dt: float,
+        forward_mps: float = 0.0,
+        lateral_mps: float = 0.0,
+        yaw_rps: float = 0.0,
+        push: bool = True,
+    ) -> None:
+        """Continuous-command motion entry point used by autonomous
+        primitives.
+
+        ``forward_mps`` and ``lateral_mps`` are body-frame velocities:
+        +forward is along body +X (the way the spot is "looking"),
+        +lateral is along body +Z (the spot's right side, since +X yaw
+        rotates +Z to the right). ``yaw_rps`` is rad/s around world +Y;
+        same sign convention as keyboard yaw_left = +.
+
+        Translation is clamped against the navmesh via
+        ``pathfinder.try_step``, exactly like the keyboard path. Yaw is
+        free. Set ``push=False`` if you are calling this from inside
+        ``step()`` and will push yourself; default ``True`` is the
+        right thing for primitives that own the tick.
+        """
+        if dt <= 0.0:
+            if push:
+                self._push()
+            return
+
+        # Body XZ translation, clamped against the navmesh.
+        if forward_mps != 0.0 or lateral_mps != 0.0:
+            cy = math.cos(self.state.yaw)
+            sy = math.sin(self.state.yaw)
+            # Body +X in world XZ after a +Y yaw: (cos yaw, -sin yaw).
+            # Body +Z (right side) in world XZ: (sin yaw,  cos yaw).
+            fwd_x = cy * forward_mps + sy * lateral_mps
+            fwd_z = -sy * forward_mps + cy * lateral_mps
+            attempted = self.state.position + mn.Vector3(
+                fwd_x * dt, 0.0, fwd_z * dt
+            )
+            self.state.position = mn.Vector3(
+                self.sim.pathfinder.try_step(self.state.position, attempted)
+            )
+
+        # Yaw (no navmesh constraint).
+        if yaw_rps != 0.0:
+            self.state.yaw += yaw_rps * dt
+
+        if push:
+            self._push()
 
     def _push(self) -> None:
         """Mirror ``self.state`` into the AO + the pan/tilt head."""

@@ -67,6 +67,14 @@ import habitat_sim
 from mumt_sim.agent.coverage import CoverageMap, CoverageMapConfig
 from mumt_sim.agent.memory import MemoryTable, default_jsonl_path
 from mumt_sim.agent.perception import CaptionWorker, GemmaClient
+from mumt_sim.agent.tools import (
+    Controller,
+    ControllerCtx,
+    GotoController,
+    MoveController,
+    PrimitiveResult,
+    resolve_goto_target,
+)
 from mumt_sim.agents import add_kinematic_humanoid, add_kinematic_spot
 from mumt_sim.display import InputState, MultiPaneWindow
 from mumt_sim.pan_tilt import PanTiltHead
@@ -309,6 +317,40 @@ def main() -> None:
     input_for_spot = (_wasd_to_input, _arrows_to_input)
     label_for_spot = ("Spot 0 (WASD)", "Spot 1 (arrows)")
 
+    # Per-Spot autonomous primitive slots. When a slot is set the main
+    # loop steps that controller instead of the WASD/arrow mapper for
+    # the corresponding Spot. Tab toggles which Spot the G/M/N/X
+    # hotkeys target.
+    active_controllers: list[Optional[Controller]] = [None, None]
+    primitive_ctxs: list[ControllerCtx] = [
+        ControllerCtx(sim=sim, spot_id=0, teleop=teleops[0], coverage=coverage),
+        ControllerCtx(sim=sim, spot_id=1, teleop=teleops[1], coverage=coverage),
+    ]
+    active_spot = 0
+    last_primitive_result: list[Optional[PrimitiveResult]] = [None, None]
+
+    def _print_result(spot_id: int, result: PrimitiveResult) -> None:
+        fx, fz, fyaw = result.final_pose
+        print(
+            f"[primitive] spot{spot_id} {result.primitive} -> "
+            f"{result.status} ({result.reason}) "
+            f"final ({fx:+.2f}, {fz:+.2f}, yaw {math.degrees(fyaw):+5.1f}) "
+            f"t={result.t_elapsed_s:.1f}s",
+            flush=True,
+        )
+
+    def _start_primitive(spot_id: int, controller: Controller) -> None:
+        existing = active_controllers[spot_id]
+        if existing is not None:
+            existing.abort("preempted by new primitive")
+            # Drain one step so we get a result row before swapping.
+            res = existing.step(0.0, primitive_ctxs[spot_id])
+            if res is not None:
+                last_primitive_result[spot_id] = res
+                _print_result(spot_id, res)
+        active_controllers[spot_id] = controller
+        controller.start(primitive_ctxs[spot_id])
+
     pane_h, pane_w = COVERAGE_PANE_HW
 
     def render_coverage_pane() -> np.ndarray:
@@ -363,8 +405,49 @@ def main() -> None:
                 break
             sim_t += dt
 
-            teleops[0].step(dt, input_for_spot[0](state))
-            teleops[1].step(dt, input_for_spot[1](state))
+            # ----- hotkey -> primitive triggers ----------------------
+            if state.switch_active_pressed:
+                active_spot = 1 - active_spot
+                print(f"[primitive] active spot -> {active_spot}", flush=True)
+
+            if state.abort_pressed:
+                ctl = active_controllers[active_spot]
+                if ctl is not None:
+                    ctl.abort("X hotkey")
+
+            if state.goto_pressed:
+                # Demo target: drive the active spot to the OTHER spot.
+                other = 1 - active_spot
+                other_pos = spot_bodies[other].translation
+                target_xz = resolve_goto_target(
+                    (float(other_pos.x), float(other_pos.z)), coverage,
+                )
+                _start_primitive(active_spot, GotoController(target_xz))
+                print(
+                    f"[primitive] spot{active_spot} GOTO -> spot{other} "
+                    f"at ({target_xz[0]:+.2f}, {target_xz[1]:+.2f})",
+                    flush=True,
+                )
+
+            if state.move_pressed:
+                _start_primitive(active_spot, MoveController(forward_m=1.0))
+                print(f"[primitive] spot{active_spot} MOVE forward 1.0 m", flush=True)
+
+            if state.turn_pressed:
+                _start_primitive(active_spot, MoveController(dyaw_rad=math.pi / 2))
+                print(f"[primitive] spot{active_spot} TURN +90 deg", flush=True)
+
+            # ----- step each spot: controller or keyboard mapper -----
+            for spot_id in (0, 1):
+                ctl = active_controllers[spot_id]
+                if ctl is not None:
+                    res = ctl.step(dt, primitive_ctxs[spot_id])
+                    if res is not None:
+                        last_primitive_result[spot_id] = res
+                        active_controllers[spot_id] = None
+                        _print_result(spot_id, res)
+                else:
+                    teleops[spot_id].step(dt, input_for_spot[spot_id](state))
 
             obs = sim.get_sensor_observations(sensor_ids)
             spot0_frame = obs[SPOT_0_HEAD_AGENT_ID][s0_rgb_uuid][:, :, :3]
@@ -415,8 +498,22 @@ def main() -> None:
             huds = []
             for i, t in enumerate(teleops):
                 pos = t.state.position
+                active_tag = "[ACTIVE]" if i == active_spot else "[idle]  "
+                ctl = active_controllers[i]
+                if ctl is not None:
+                    mode_line = f"mode: PRIMITIVE  {ctl.status_text()}"
+                else:
+                    last = last_primitive_result[i]
+                    if last is not None:
+                        mode_line = (
+                            f"mode: TELEOP    last {last.primitive}={last.status} "
+                            f"({last.reason})"
+                        )
+                    else:
+                        mode_line = "mode: TELEOP"
                 hud = [
-                    label_for_spot[i],
+                    f"{active_tag} {label_for_spot[i]}",
+                    mode_line,
                     f"pos ({pos.x:+.2f}, {pos.y:+.2f}, {pos.z:+.2f}) m",
                     f"yaw {math.degrees(t.state.yaw):+6.1f} deg",
                 ]
@@ -456,6 +553,8 @@ def main() -> None:
                 f"s0 sector {label_s0}   s1 sector {label_s1}",
                 f"stamped this tick: spot0={cells_stamped[0]}  spot1={cells_stamped[1]}",
                 f"memory rows: {len(memory)}",
+                f"active=spot{active_spot}   "
+                f"[Tab] swap  [G] goto-other  [M] +1m  [N] +90deg  [X] abort",
             ]
 
             window.show([
