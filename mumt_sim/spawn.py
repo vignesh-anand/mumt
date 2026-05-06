@@ -1,6 +1,7 @@
 """Navmesh-aware spawn utilities."""
 from __future__ import annotations
 
+import math
 from typing import List, Sequence, Tuple
 
 import numpy as np
@@ -129,35 +130,81 @@ def find_open_spawn_spot(
     pathfinder,
     min_clearance: float = 1.5,
     n_samples: int = 800,
+    max_floor_dy: float = 0.30,
+    top_k: int = 10,
+    rng: "np.random.Generator | None" = None,
 ) -> Tuple[Sequence[float], float]:
-    """Search the navmesh for the most-open navigable point.
+    """Search the navmesh for an open *floor-level* navigable point.
 
     Returns ``(point, clearance)`` where ``clearance`` is the distance in
     metres from ``point`` to the nearest obstacle (wall or static collider).
-    Samples ``n_samples`` random navigable points and keeps the best.
+
+    Samples ``n_samples`` random navigable points, filters them to within
+    ``max_floor_dy`` metres of the median sample Y (which gives us the
+    floor height in HSSD scenes -- sofas, beds, etc. show up as elevated
+    minority navmesh patches), keeps every candidate with clearance
+    >= ``min_clearance``, and picks **one at random from the top-``top_k``**
+    by clearance.
+
+    Picking from the top-K rather than the single max means restarting
+    the server gets you a different spawn each time -- useful when the
+    global maximum-clearance point happens to be inside furniture
+    geometry that ``distance_to_closest_obstacle`` doesn't account for
+    (HSSD has e.g. low couches whose seat is at floor Y, with a wide
+    free hemisphere above that fools the obstacle metric).
+
+    Pass ``rng`` to seed the tiebreaker; defaults to fresh randomness.
 
     Raises RuntimeError if no sample meets ``min_clearance``.
     """
+    if rng is None:
+        rng = np.random.default_rng()
     if not pathfinder.is_loaded:
         raise RuntimeError("pathfinder.is_loaded == False")
 
-    best_pt = None
-    best_clear = -1.0
+    # Pass 1: sample, record candidates with their clearances + ys.
+    pts: list = []
+    ys: list = []
+    clears: list = []
     for _ in range(n_samples):
         p = pathfinder.get_random_navigable_point()
         if not np.all(np.isfinite(p)):
             continue
         c = float(pathfinder.distance_to_closest_obstacle(p))
-        if c > best_clear:
-            best_clear = c
-            best_pt = np.asarray(p, dtype=np.float32).tolist()
+        if not math.isfinite(c):
+            continue
+        pts.append(np.asarray(p, dtype=np.float32))
+        ys.append(float(p[1]))
+        clears.append(c)
 
-    if best_pt is None or best_clear < min_clearance:
+    if not pts:
         raise RuntimeError(
-            f"No navigable point with clearance >= {min_clearance} m "
+            f"No navigable points sampled (out of {n_samples})"
+        )
+
+    floor_y = float(np.median(ys))
+
+    qualified: list = []
+    for p, y, c in zip(pts, ys, clears):
+        if abs(y - floor_y) > max_floor_dy:
+            continue
+        if c >= min_clearance:
+            qualified.append((c, p))
+
+    if not qualified:
+        best_clear = max(clears) if clears else -1.0
+        raise RuntimeError(
+            f"No floor-level (|dy|<={max_floor_dy} m vs median {floor_y:.2f}) "
+            f"navigable point with clearance >= {min_clearance} m "
             f"(best={best_clear:.2f} m over {n_samples} samples)"
         )
-    return best_pt, best_clear
+
+    # Sort by clearance descending and pick uniformly from the top-K.
+    qualified.sort(key=lambda cp: -cp[0])
+    pool = qualified[: max(1, int(top_k))]
+    idx = int(rng.integers(0, len(pool)))
+    chosen_clear, chosen_pt = pool[idx]
+    return chosen_pt.tolist(), float(chosen_clear)
 
 
 def _geodesic_distance(pathfinder, a, b) -> float:
