@@ -17,9 +17,86 @@ habitat_hitl:
   # the camera. Other clients (future multi-user observer view) will need a
   # different policy.
   hide_humanoid_in_gui: True
-  window:
-    title: "Mumt HITL"
+  # No server-side GUI window: the user is in VR via the Quest client, the
+  # desktop window would just be a debug viewport that nobody looks at.
+  # Running headless also sidesteps a magnum.text.Renderer2D removal in
+  # newer magnum builds and the cv2 vs. habitat-sim GLX init-order trap on
+  # Mesa+Intel Arc -- both only matter when habitat-hitl spins up GLFW.
+  window: ~
+  experimental:
+    headless:
+      do_headless: True
+  networking:
+    enable: True
+    port: 8888
+    # The current siro_hitl_unity_client (HEAD = dbfa5a6) does not send the
+    # ``isClientReady`` handshake field, so we mock it on the server side.
+    # See README M3a.3 / "Problems and fixes" for context.
+    mock_connection_params_dict:
+      isClientReady: true
 
 mumt:
   dataset: "data/scene_datasets/hssd-hab/hssd-hab.scene_dataset_config.json"
   scene: "102344049.scene_instance.json"
+  # Lift applied to the humanoid AO's translation Y so its feet clear the
+  # floor instead of clipping. SMPL-X URDF root is at the pelvis with legs
+  # hanging ~0.95 m below; HSSD navmeshes also sit a hair above the visible
+  # floor, so 1.0 m clears the gap. Tune at the CLI if avatars look stilted
+  # or sunken: ``mumt.humanoid_pelvis_lift_m=0.95``.
+  humanoid_pelvis_lift_m: 1.00
+  # Same idea for Spot: URDF root is at the body, feet hang ~0.48 m below.
+  # Habitat-lab's SpotRobot uses base_offset=(0, -0.48, 0) for this reason.
+  spot_base_lift_m: 0.48
+
+  # ----- Autonomy stack (M3c phase E) ----------------------------------
+  # Toggle the whole multi-Spot LLM stack: per-Spot AgentLoops, the
+  # OrchestratorLoop, coverage map, ambient captioning, YOLOE find, and
+  # text-only recall. When false the app behaves exactly as the pre-
+  # autonomy VR demo (left stick walks the human, right stick drives
+  # Spot 0, Spot 1 stands still, no LLMs).
+  autonomy:
+    enabled: false
+    # Gemini model used for each per-Spot AgentLoop's ReAct chat. The
+    # multi-spot script uses gemini-3.1-flash-lite-preview by default.
+    agent_model: "gemini-3.1-flash-lite-preview"
+    # Single LLM that fans user messages out to the per-Spot loops.
+    orchestrator_model: "gemini-3.1-flash-lite-preview"
+    # Ambient caption worker (per Spot, ~2 Hz).
+    caption_model: "gemini-3.1-flash-lite-preview"
+    # Recall LLM for the recall() primitive.
+    recall_model: "gemini-3.1-flash-lite-preview"
+    # YOLOE find() backend. Leave blank to fall back to the
+    # MUMT_YOLOE_URL env var (default http://localhost:8080 in the
+    # other scripts). The detector is best-effort: if the server is
+    # unreachable, find() surfaces per-call errors but the rest of
+    # the stack keeps running.
+    yoloe_url: ""
+
+    # ----- Speech-to-text + push-to-talk -------------------------------
+    # Right B button gates a host-mic recording; on release we send the
+    # audio to the configured STT backend and post the transcript to
+    # the orchestrator.
+    #
+    #   backend: "gemini"     -- reuses GEMINI_API_KEY (default).
+    #   backend: "elevenlabs" -- ElevenLabs Scribe; needs
+    #                            ELEVENLABS_API_KEY + the ``elevenlabs``
+    #                            SDK; only useful on a paid plan now
+    #                            that the free tier is rate-limited.
+    #
+    # ``model`` is backend-specific: for gemini it must be a Gemini
+    # model id (default: gemini-3.1-flash-lite-preview); for elevenlabs
+    # it must be a Scribe model id (e.g. "scribe_v1").
+    stt:
+      enabled: false
+      backend: "gemini"
+      model: "gemini-3.1-flash-lite-preview"
+      sample_rate: 16000
+
+  # ----- Pointing (right controller raycast) ---------------------------
+  # When the right trigger is held the server samples the right
+  # controller's pose and raycasts into the scene (and onto the HUD's
+  # top-down map quad if it's the active mode). The closest hit is
+  # appended to the user message as ``(user pointed to (x, y, z))``.
+  pointing:
+    enabled: true
+    max_dist_m: 25.0

@@ -251,6 +251,48 @@ Routing rules
 
 5. Ambiguity that you cannot resolve -> `ask_user(...)`.
 
+Pointer events
+--------------
+The user is in VR and can point at things with the right Quest
+controller. When they do, their utterance arrives prefixed with a
+literal annotation:
+
+    (user pointed to (+X.XX, +Y.YY, +Z.ZZ)) <rest of utterance>
+
+The triple is a habitat world-space point in metres -- X is east,
+Y is up, Z is south. Treat the prefix as deictic context for words
+like "this", "that", "here", "there", "go there", "what is that".
+
+Routing requirements for messages that carry a pointer prefix:
+
+a. PRESERVE the prefix verbatim on every outbound `tell`. The
+   receiving spot's agent knows how to consume `"x,z"` setpoints
+   directly via its `goto` tool, and needs the coordinate to ground
+   the deictic phrase. Do NOT drop, summarise, or rewrite the
+   parenthesised triple.
+
+b. If you split work across spots, attach the SAME pointer prefix
+   to whichever spot inherits the deictic phrase. The other spot's
+   sub-task does not need it. Example with two spots:
+       user: "(user pointed to (+1.20, +0.30, -2.40)) spot 0 go
+              there, spot 1 keep watching the door"
+       ->
+       tell(spot_ids=[0],
+            message="(user pointed to (+1.20, +0.30, -2.40)) go there")
+       tell(spot_ids=[1],
+            message="keep watching the door")
+
+c. If the user routes to BOTH spots with a deictic command
+   ("everyone come here", "look at this"), pass the prefix through
+   to ALL recipients verbatim:
+       tell(spot_ids=[{ids}],
+            message="(user pointed to (+X.XX, +Y.YY, +Z.ZZ)) <verbatim>")
+
+d. If the user pointed but did NOT say anything actionable
+   (e.g. transcript was empty or just "uh"), the user message you
+   receive is the bare prefix. Do not route -- there's no
+   instruction. Use `ask_user("did you mean to send a command?")`.
+
 Style
 -----
 Keep messages short and instruction-shaped. Don't add commentary,
@@ -383,7 +425,15 @@ class OrchestratorLoop:
                 continue
 
             fcs = list(getattr(response, "function_calls", []) or [])
-            text = (response.text or "").strip()
+            # Reading ``response.text`` when the response contains
+            # function_call parts triggers a noisy google-genai warning
+            # ("non-text parts in the response: ['function_call']"). Skip
+            # the read in that case -- the function-calling path below
+            # consumes ``fcs`` directly and doesn't need ``text``.
+            if fcs:
+                text = ""
+            else:
+                text = (response.text or "").strip()
             if text and self.on_thinking:
                 try:
                     self.on_thinking(text)

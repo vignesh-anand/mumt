@@ -8,3 +8,12 @@ pynput>=1.7
 google-genai>=0.3
 requests>=2.31
 
+# ----- M3c phase E autonomy + voice (optional) -----------------------
+# Required when mumt.autonomy.enabled=true in scripts/config/mumt_hitl.yaml.
+# Skip these on hosts that only run the pure-VR demo path (autonomy off
+# default). All four are import-guarded inside the codebase, so a host
+# missing one of them surfaces a single warning at startup but the rest
+# of the stack keeps working.
+elevenlabs>=1.0      # ElevenLabs Scribe STT (mumt_sim.agent.voice)
+sounddevice>=0.4     # Host-mic push-to-talk capture
+

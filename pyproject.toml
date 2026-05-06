@@ -12,6 +12,19 @@ dependencies = [
     "imageio",
 ]
 
+[project.optional-dependencies]
+# Pulled in when ``mumt.autonomy.enabled=true`` in mumt_hitl.yaml. The
+# basic VR demo doesn't need any of these.
+autonomy = [
+    "google-genai>=0.3",
+    "requests>=2.31",
+    "opencv-python>=4.8",
+]
+voice = [
+    "elevenlabs>=1.0",
+    "sounddevice>=0.4",
+]
+
 [tool.setuptools.packages.find]
 include = ["mumt_sim*"]
 exclude = ["third_party*", "data*", "renders*", "scripts*"]
