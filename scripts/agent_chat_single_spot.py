@@ -102,9 +102,13 @@ SCENE_INSTANCE = HSSD_ROOT / "scenes" / "102344049.scene_instance.json"
 
 LIVE_HW = (480, 640)
 
-# Single Spot fills more of the window; map underneath.
-POV_PANE_HW = (540, 960)
-COVERAGE_PANE_HW = (420, 960)
+# Sized in LOGICAL pixels for a 2x HiDPI Ubuntu desktop. The cv2
+# canvas reports e.g. 480 px wide but the WM upscales 2x so it takes
+# ~960 physical px on the right-screen column. Habitat still renders
+# at 480x640 and we let cv2 downscale into the small panes so HiDPI
+# text + sensor frames stay sharp on the display.
+POV_PANE_HW = (270, 480)
+COVERAGE_PANE_HW = (210, 480)
 
 TARGET_FPS = 60
 SPOT_HEAD_HFOV_DEG = 110.0

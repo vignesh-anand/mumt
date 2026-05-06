@@ -1,15 +1,18 @@
 #!/usr/bin/env python
 """M-Agent.3 Slice B: two-Spot chat harness with an LLM orchestrator.
 
-Layout:
-  +----------------------+----------------------+
-  |  Spot 0 head POV     |  Spot 1 head POV     |  top row
-  |  + HUD overlay       |  + HUD overlay       |
-  +----------------------+----------------------+
-  |                                             |
-  |   Shared coverage map (5 m sectors)         |  bottom row
-  |                                             |
-  +----------------------+----------------------+
+Layout (vertical stack so it fits in a ~960 x 1800 right-of-screen
+column on a 2880 x 1800 laptop):
+
+  +-----------------------------------+
+  |   Spot 0 head POV  + HUD overlay  |
+  +-----------------------------------+
+  |   Spot 1 head POV  + HUD overlay  |
+  +-----------------------------------+
+  |                                   |
+  |  Shared coverage map (5 m sectors)|
+  |                                   |
+  +-----------------------------------+
 
 User chats in the terminal. The orchestrator is an LLM whose only
 job is to route each user message to spot 0, spot 1, or both. Spot
@@ -96,9 +99,13 @@ SCENE_INSTANCE = HSSD_ROOT / "scenes" / "102344049.scene_instance.json"
 
 LIVE_HW = (480, 640)
 
-# Two POV panes side-by-side, then one wide map under them.
-POV_PANE_HW = (480, 640)
-COVERAGE_PANE_HW = (420, 1280)
+# Vertical stack sized in LOGICAL pixels for a 2x HiDPI Ubuntu desktop:
+# the cv2 canvas reports e.g. 480 px wide but the WM upscales 2x so
+# it occupies ~960 physical px of the right-screen column. Habitat
+# still renders at 480x640 and we let cv2 downscale into the small
+# panes so HiDPI text + sensor frames stay sharp on the display.
+POV_PANE_HW = (270, 480)
+COVERAGE_PANE_HW = (360, 480)
 
 TARGET_FPS = 60
 SPOT_HEAD_HFOV_DEG = 110.0
@@ -493,7 +500,8 @@ def main() -> None:
     # ----- window + main loop -------------------------------------------
     window = MultiPaneWindow(
         pane_grid=[
-            [POV_PANE_HW, POV_PANE_HW],
+            [POV_PANE_HW],
+            [POV_PANE_HW],
             [COVERAGE_PANE_HW],
         ],
         title="mumt M-Agent.3 - chat agent (multi spot + orchestrator)",
