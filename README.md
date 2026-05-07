@@ -1,7 +1,7 @@
 # mumt
 
-Habitat 3 simulation with 2 Spot-like robots and 1 humanoid in an HSSD scene.
-Eventual VR embodiment of the human via Habitat-HITL.
+Habitat 3 simulation with 2 LLM-driven Spot-like robots and a VR-embodied
+human operator in an HSSD scene, served to a Quest 2 over Habitat-HITL.
 
 ## Status
 
@@ -10,44 +10,80 @@ Eventual VR embodiment of the human via Habitat-HITL.
   and 1 kinematic humanoid with per-Spot pan/tilt RGB-D heads.
 - **M2a (done):** keyboard teleop of Spot 0 with continuous diff-drive
   velocity + arrow-key pan/tilt, live split-screen display.
-- **M2b/c (planned):** autonomous geodesic-follower Spots, SMPL-X walking humanoid.
+- **M2b/c (superseded):** original plan was geodesic-follower Spots + SMPL-X
+  walking humanoid. We pivoted to the LLM-autonomy stack (M-Agent.\*) instead;
+  legged gait + animated humanoid stay open as future polish.
 - **M3a (done):** habitat-hitl runtime stack validation - Unity Editor
   on Linux acts as the VR client over localhost. No headset yet.
 - **M3b (done):** Quest 2 sideload of the same Unity client. HSSD scene
   102344049 streams from a desktop habitat-hitl server over USB-tether and
   renders inside the headset, head-tracked.
-- **M3c (planned):** custom mumt HITL app with embodied human + VR-driven
-  Spot teleop + floating HUD panels.
+- **M-Agent.2 (done):** two-spot keyboard teleop with shared top-down
+  coverage map + 1 m chess-named sectors, ambient Gemini Flash Lite
+  captions, per-run perception-memory JSONL, and the
+  `goto`/`move`/`search`/`find`/`recall` action primitives.
+- **M-Agent.3 (done):** per-Spot event-driven ReAct `AgentLoop` on top of
+  those primitives, plus an LLM orchestrator that fans terminal chat to
+  one or both Spots concurrently.
+- **M3c (done):** custom `mumt_hitl_app` with VR-embodied human (head /
+  yaw / left-stick locomotion + `teleportAvatarBasePosition` keyframes),
+  right-stick teleop of Spot 0, server-side virtual-display framework,
+  and a phase-E graft of the M-Agent.\* autonomy stack into VR (per-Spot
+  head sensors, manual override, push-to-talk + STT, controller-pointing).
 
-See `/home/vignesh/.cursor/plans/` for the live planning docs and the
-[Milestones](#milestones) section below for the running technical journal.
+See `/home/vignesh/.cursor/plans/` for the live planning docs -- the
+relevant ones since M3b are `m_agent_2_coverage_memory_teleop_*`,
+`action_primitives_goto_and_move_*`, `search-sector-primitive_*`,
+`recall_memory_tool_*`, `agent_loop_module_*`, and
+`m3c_autonomy_integration_*`. The [Milestones](#milestones) section
+below is the running technical journal.
 
 ## Layout
 
 ```
 mumt/
   .venv/                              # Python 3.10 venv (isolated)
+  .venv-magnum/                       # Python 3.11 venv for magnum-tools
   third_party/
     habitat-sim/                      # fresh clone, built from source
     habitat-lab/                      # fresh clone, pip -e installed
+    siro_hitl_unity_client/           # Unity client + APK build dir (M3a/b)
+    magnum-tools/                     # mosra/magnum-ci artifact (M3b)
   data/                               # all assets local to this repo
     scene_datasets/hssd-hab/          # one HSSD scene (gated)
     robots/hab_spot_arm/              # Spot URDF + meshes
     humanoids/humanoid_data/          # SMPL-X humanoid URDFs
   mumt_sim/
     scene.py     agents.py     spawn.py     pan_tilt.py
-    teleop.py    display.py
+    teleop.py    display.py    vr_displays.py
+    agent/                            # M-Agent.* autonomy stack
+      coverage.py    memory.py        # 2-tier grid + perception-memory
+      perception.py  detection.py     # Gemini caption / YOLOE detect clients
+      recall.py      visibility.py    # text recall + greedy set-cover planner
+      tools.py       loop.py          # action primitives + per-Spot ReAct agent
+      orchestrator.py                 # LLM router across both Spots
+      head_cam.py    voice.py         # AO-mounted RGB+depth, PTT + STT
+      pointing.py                     # right-controller raycast for VR
   scripts/
     01_install_env.sh                 # bootstrap venv + clone + build
     02_fetch_assets.sh                # hf login + dataset_downloader + hf download
     03_install_unity_hub.sh           # M3a.1: apt install unityhub (sudo)
     04_install_vr_assets.sh           # M3a.2: clone unity client + magnum env
     05_process_unity_data.sh          # M3b.1: bake HSSD scene into Unity GLBs
-    06_run_sim_viewer_server.sh       # M3a.3: run habitat-hitl server on :8888
+    06_run_sim_viewer_server.sh       # M3a.3: run habitat-hitl sim_viewer on :8888
+    07_run_mumt_hitl_server.sh        # M3c: run our custom mumt_hitl_app
     process_unity_hssd.py             # M3b.1: dataset processing config
+    config/mumt_hitl.yaml             # M3c: Hydra config for mumt_hitl_app
     render_two_spots_one_human.py     # M1 deliverable
     teleop_spot.py                    # M2a deliverable
+    teleop_two_spots_with_coverage.py # M-Agent.2 deliverable
+    agent_chat_single_spot.py         # M-Agent.3 slice A deliverable
+    agent_chat_multi_spot.py          # M-Agent.3 slice B deliverable
+    mumt_hitl_app.py                  # M3c deliverable (the HITL server)
+    find_centering_smoketest.py       # M-Agent.2 slice G dev harness
   renders/                            # output PNGs (gitignored)
+  outputs/                            # per-run perception-memory JSONL + thumbs
+  _data_processing_output/            # baked Unity GLBs (M3b)
 ```
 
 ## Setup
@@ -59,22 +95,57 @@ bash scripts/01_install_env.sh
 bash scripts/02_fetch_assets.sh
 ```
 
-Then activate the venv and run the M1 sanity render:
+Then activate the venv and run any of the entry points below:
 
 ```bash
 source .venv/bin/activate
+
+# M1: one-shot static render of 2 Spots + 1 humanoid (no env vars needed).
 python scripts/render_two_spots_one_human.py
+#   -> renders/{observer, spot_{0,1}_head_rgb, spot_{0,1}_head_depth}.png
+
+# M2a: live keyboard teleop of Spot 0 (no env vars needed).
+python scripts/teleop_spot.py
+
+# M-Agent.2: 2-spot teleop + coverage + autonomy primitives.
+#   GEMINI_API_KEY  -> required for ambient captions, search, recall
+#   MUMT_YOLOE_URL  -> required for find(label); default http://localhost:8080
+python scripts/teleop_two_spots_with_coverage.py
+
+# M-Agent.3: terminal chat against one (or two) LLM-driven Spots.
+python scripts/agent_chat_single_spot.py
+python scripts/agent_chat_multi_spot.py
+
+# M3c: VR HITL server for the Quest client.
+#   Pure VR demo path needs no env vars; flip mumt.autonomy.enabled=true
+#   in scripts/config/mumt_hitl.yaml (or override on the CLI) to bring
+#   the M-Agent.* stack into VR -- then GEMINI_API_KEY / MUMT_YOLOE_URL
+#   matter again, plus a host mic for push-to-talk.
+bash scripts/07_run_mumt_hitl_server.sh
 ```
 
-Outputs land in `renders/`.
+Outputs land in `renders/` (M1) and `outputs/` (M-Agent.\* memory JSONL + thumbs).
 
 ## Prerequisites
 
 - Linux with X / OpenGL.
-- Python 3.10 (we use the system `/usr/bin/python3.10`).
+- Python 3.10 (we use the system `/usr/bin/python3.10`) for the main venv,
+  Python 3.11 for `.venv-magnum` (M3b only; see M3b notes).
 - Build tools: `cmake`, `ninja`, `git`, `gcc`/`g++`.
 - CUDA toolkit if building habitat-sim with `--with-cuda` (optional; CPU-only build also works).
 - A Hugging Face account with access granted to `hssd/hssd-hab` (gated dataset).
+- `GEMINI_API_KEY` from Google AI Studio for the autonomy stack (ambient
+  captions, `search`, `recall`, ReAct agent, orchestrator, default Gemini
+  STT). Optional unless `mumt.autonomy.enabled=true` or you launch one of
+  the `agent_chat_*` / `teleop_two_spots_with_coverage` scripts.
+- Optional Jetson YOLOE server reachable at `MUMT_YOLOE_URL` (defaults
+  to `http://localhost:8080`) for the `find(label)` primitive. The rest
+  of the stack runs without it -- `find()` just surfaces a per-call error.
+- Host microphone reachable through `sounddevice` for the M3c
+  push-to-talk path. `ELEVENLABS_API_KEY` is only needed if you switch
+  `mumt.autonomy.stt.backend` from `gemini` to `elevenlabs`.
+- `adb` (`android-tools-adb`) for the Quest sideload + reverse-tunnel
+  workflow in M3b / M3c.
 
 ## Milestones
 
@@ -530,3 +601,463 @@ streams in head-tracked.
 - Lighting on the streamed HSSD stage. The stage GLB has no baked lights, so
   the VR scene is dim. M3c will either ship a light pass through
   ``sim_viewer`` config or place Unity-side lights into the ``PlayerVR`` scene.
+
+### M-Agent.2 - Coverage substrate, perception memory, action primitives
+
+**Goal:** build the substrate the autonomy layer reads from - a shared
+top-down coverage map keyed on chess-named sectors, an append-only
+perception-memory table fed by ambient Gemini captions + YOLOE detections,
+and the atomic action primitives (`goto` / `move` / `search` / `find` /
+`recall`) - exercised end-to-end via a 2-spot keyboard-teleop demo before
+any LLM is wired up.
+
+**Deliverable / how to run:**
+
+```bash
+source .venv/bin/activate
+export GEMINI_API_KEY=...                    # for captions / search / recall
+export MUMT_YOLOE_URL=http://localhost:8080  # for find(label); optional
+python scripts/teleop_two_spots_with_coverage.py
+```
+
+Layout: two head-RGB panes on top + a full-width top-down coverage map on
+the bottom (HiDPI-friendly vertical stack, fits a 2880x1800 laptop's
+right-of-screen column without overflow). Both Spots drive simultaneously
+from one keyboard:
+
+| Key             | Action                                                         |
+| --------------- | -------------------------------------------------------------- |
+| `W` `A` `S` `D` | Spot 0 forward / yaw-left / back / yaw-right                   |
+| arrow keys      | Spot 1 forward / yaw / back                                    |
+| `Shift`         | 2x speed boost (both Spots)                                    |
+| `R`             | reset both Spots to spawn                                      |
+| `Tab`           | switch the **active** Spot (target of the action primitives)   |
+| `G`             | `goto` the **other** Spot's coarse sector (active Spot)        |
+| `M` / `N`       | `move` 1 m forward / turn 90 deg on the active Spot            |
+| `F`             | `search` the active Spot's current sector                      |
+| `H`             | `find` a hard-coded label (currently `"human"`) in current sector |
+| `Q`             | `recall` over the perception-memory JSONL                      |
+| `X`             | abort the active Spot's running primitive                      |
+| `Esc`           | quit + flush logs                                              |
+
+Each run drops a `outputs/memory_<unix>.jsonl` next to the existing
+captioner thumbnails.
+
+**Conventions established here:**
+
+- **Two-tier grid in `mumt_sim/agent/coverage.py`.** A 10 cm fine
+  occupancy grid (per-Spot `last_seen_t`, navigable / non-navigable) is
+  rolled up into 1 m chess-named coarse cells (`A1..G7`). Every spatial
+  concept the autonomy layer touches - goal targets, memory rows, HUD
+  labels, search regions - is keyed on the chess label. The single
+  conversion module also owns `world_xz_for_coarse_label`,
+  `coarse_label_for_world_xz`, `sector_fine_indices`, `neighbour_labels`,
+  `region_navigable_mask`, and a sensor-direct
+  `cam_T_world_from_sensor(sensor)` so M3c's body-mounted sensors can
+  feed the same map without going through a habitat agent.
+- **Per-Spot RGB+depth update path.** Each tick we back-project the
+  Spot's depth pixels through its head-cam intrinsics into world XZ and
+  stamp every fine cell each pixel hits; the coverage pane shades cyan
+  for Spot 0, magenta for Spot 1, blends to white where they overlap,
+  and fades from full-bright (just-seen) to ~30 % brightness over 5 min.
+- **Append-only `MemoryTable`** (`mumt_sim/agent/memory.py`). One writer
+  thread, lock-free reads, JSONL persistence under `outputs/memory_<unix>.jsonl`.
+  `MemoryRow` schema: `(t_sim, spot_id, kind, sector, body_pose,
+  head_pan, head_tilt, payload)` with `kind in {"caption", "detection",
+  "self"}`. `default_jsonl_path()` is the canonical path helper.
+- **`OnDemand*` thread-pool wrappers** for everything that calls a
+  network: `OnDemandCaptioner` over `GeminiClient`, `OnDemandDetector`
+  over `YoloeClient`, `OnDemandRecaller` over `RecallClient`. Each owns
+  a small `ThreadPoolExecutor`, exposes `submit(...) -> Future`, and
+  has drop-oldest backpressure so the main loop never blocks on Gemini
+  / YOLOE. Default models for everything: `gemini-3.1-flash-lite-preview`
+  (overridable via `MUMT_AGENT_MODEL` / `MUMT_CAPTION_MODEL` /
+  `MUMT_RECALL_MODEL`).
+- **`CaptionWorker`** (`mumt_sim/agent/perception.py`) is the ambient
+  per-Spot caption loop: ~2 Hz Gemini Flash Lite calls on the latest head
+  RGB, parse `parse_ambient_caption()`, post a `kind="caption"` row into
+  `MemoryTable`. Search reuses the same client with the
+  `SEARCH_VIEWPOINT_PROMPT` and `parse_search_caption()`.
+- **`Controller` interface** in `mumt_sim/agent/tools.py`. A primitive
+  is just a `step(dt, ctx) -> Optional[PrimitiveResult]` state machine;
+  the same controllers run from the hotkeys above and (M-Agent.3) from
+  LLM tool calls. `ControllerCtx` carries `latest_rgb`, `latest_depth`,
+  pose, coverage handle, and memory handle so primitives stay framework-
+  agnostic. Every primitive returns a `PrimitiveResult(status, reason,
+  t_elapsed_s, final_pose, path_followed)` with `status in {"success",
+  "unreachable", "blocked", "aborted", "timeout"}`.
+- **`SearchSectorController`** plans viewpoints with a random-sample
+  greedy set-cover in `mumt_sim/agent/visibility.py`: 100 sample
+  positions x 12 yaws inside the target sector + 8-neighbour ring, FOV
+  cone (default 70 deg HFOV from Spot's head sensor) and Bresenham LOS
+  on the navigable mask, K=6 viewpoints or until next-best gain < 10
+  cells. Each viewpoint is driven via `GotoController` ->
+  `MoveController(dyaw)` to face -> synchronous Gemini search-prompt
+  caption -> append `(pose, caption)` to `SearchResult`. Tour order is
+  TSP-cheap (nearest-neighbour) since the optimiser bake (`eb421b0`).
+- **`FindLabelController`** pipelines YOLOE detections on the latest
+  head RGB across the same viewpoint tour; on first hit it switches to
+  a depth-driven approach motion (head-cam depth median in the bbox ->
+  goto the back-projected world XYZ minus standoff). Returns
+  `FindResult(label, observations=[...], approach_pose, status)`.
+- **`RecallController`** dumps every `MemoryRow` into a single Gemini
+  Flash Lite prompt (text-only `RecallClient`) and returns
+  `RecallResult(answer, n_rows, t_call_s)`. No embeddings, no text
+  search - the dump is short enough that LLM context handles it.
+- **`SpotTeleop.drive(dt, fwd_mps, lat_mps, yaw_rps)`** is the
+  continuous-velocity control path the controllers use; the M2a
+  `step(dt, controls)` keeps the boolean WASD path by translating into
+  `drive(...)`. Lateral support exists at the API surface even though
+  no current controller uses it.
+
+**Problems hit and how we solved them:**
+
+- **Open YOLOE on a rotating class list crushed Jetson throughput**
+  (~0.7 FPS on `set_classes` reload vs. ~9 FPS on a fixed list)
+  -> freeze the open-vocab class list at startup
+  (`YoloeClient.open_classes` env-overridable via `YOLOE_CLASSES`),
+  `OnDemandDetector` enforces a single-flight queue with drop-oldest
+  backpressure so the worker stays on the fast path.
+- **`cv2` window + habitat-sim renderer on the same NVIDIA GLX context
+  segfaulted on the first sensor obs** (same class of crash as the M2a
+  pygame issue, but now triggered by `cv2.namedWindow` after the
+  habitat-sim EGL/GL context binds first) -> warm cv2 with a throwaway
+  window before importing habitat-sim (the `_mumt_cv2_warmup` dance at
+  the top of `scripts/teleop_two_spots_with_coverage.py`,
+  `agent_chat_*.py`, etc.). Standardised across every script that opens
+  a cv2 window alongside habitat-sim.
+- **`find_open_spawn_spot` kept landing the humanoid inside couches.**
+  HSSD couches sit at floor Y with a wide free hemisphere above the
+  seat, so `distance_to_closest_obstacle` ranks them as "open spots"
+  -> floor-level filter (reject candidates where the navmesh height
+  jumps inside a small radius) plus randomized top-K pick in
+  `mumt_sim/spawn.py:find_open_spawn_spot`. Each restart now picks a
+  fresh spawn from the top 10, so a bad pick is one Ctrl-C away.
+- **`SearchSectorController` blocked the main loop while waiting on
+  per-viewpoint Gemini calls** (~1 s each, plus driving) -> pipeline
+  the captions via `OnDemandCaptioner.submit()` so the next viewpoint
+  starts driving while the previous one's caption is still in flight.
+  Aggregated in the `eb421b0` slice-F+ optimisation pass alongside the
+  TSP tour-order tweak and a lighter planner.
+
+**What we deliberately punted:**
+
+- **No LLM in this milestone.** Hotkeys drive everything; `recall` is
+  the only LLM call in the loop. The full chat / ReAct integration
+  lands in M-Agent.3.
+- **Per-Spot pan / tilt sweeps.** Heads stay locked at the initial
+  slight downtilt; the body's yaw does the sweeping. Trivial to add
+  back via the M2a head-control path if a future primitive needs it.
+- **SLAM / GT-replacement.** Coverage uses ground-truth habitat poses
+  and frustum back-projection, not SLAM. Deferred indefinitely - this
+  is research scaffolding, not a robotics paper.
+- **Cross-spot memory queries.** Each Spot's `recall` only sees its own
+  memory rows; cross-Spot recall is a one-line filter change once we
+  have a use case.
+
+### M-Agent.3 - Per-Spot ReAct AgentLoop + LLM orchestrator
+
+**Goal:** put each Spot under its own LLM, talk to both via a single
+terminal chat, and demonstrate concurrent autonomous behaviour
+(searching / recalling / approaching) on top of the M-Agent.2 primitives
+without changing the primitives themselves.
+
+**Deliverable / how to run:**
+
+```bash
+source .venv/bin/activate
+export GEMINI_API_KEY=...                    # required
+export MUMT_YOLOE_URL=http://localhost:8080  # for find(label); optional
+
+# Slice A: one Spot, terminal in / world out.
+python scripts/agent_chat_single_spot.py
+
+# Slice B: two Spots + LLM orchestrator that routes user lines.
+python scripts/agent_chat_multi_spot.py
+```
+
+Each user line is delivered to the orchestrator (slice B) or directly
+to the agent (slice A); the agent's `<speak>` text echoes back to the
+terminal prefixed with `spot> `. Special chat commands:
+
+| Command       | Effect                                                  |
+| ------------- | ------------------------------------------------------- |
+| `:abort`      | tell BOTH agents to stop their running primitive        |
+| `:abort 0`    | tell only Spot 0 to stop                                |
+| `:quit`       | clean shutdown (flushes memory JSONL, stops workers)    |
+
+**Conventions established here:**
+
+- **Per-Spot event-driven `AgentLoop`** (`mumt_sim/agent/loop.py`).
+  Each Spot has its own `EventBus` (bounded `queue.Queue`, drop-oldest)
+  receiving `UserMessage` / `ToolStarted` / `ToolProgress` / `ToolResult`
+  / `ToolFailed` / `ToolStopped`. The agent thread blocks on
+  `bus.drain(timeout)` and only calls Gemini when there's something new -
+  one Gemini call per **wake**, never per event. Long primitives
+  (`search`, `find`) auto-emit `ToolProgress` between viewpoints so the
+  agent can react mid-flight without polling.
+- **Three-channel output contract.** Every model turn produces
+  `<thinking>...</thinking>`, optional `<speak>...</speak>`, and exactly
+  one Gemini native function call from `{goto, move, search, find,
+  recall, stop, done}`. `parse_thinking_speak()` tolerates missing
+  tags. If a primitive is running and the agent emits a non-`stop`
+  action, `ToolDispatcher` auto-stops the in-flight one and emits
+  `ToolStopped(reason="auto: superseded")` so the agent sees what
+  happened.
+- **`ToolDispatcher` is the only thing the agent talks to.** It owns
+  per-Spot pending / current slots and is the only path that touches
+  habitat-sim - the `AgentLoop` thread never imports the sim. The main
+  loop drains `try_start_pending(spot_id)` each tick (matches the
+  pattern from `agent_chat_multi_spot.py` lines 556-576).
+- **`OrchestratorLoop`** (`mumt_sim/agent/orchestrator.py`) is its own
+  LLM with two functions: `tell(spot_id: int, text: str)` to fan a
+  user message out to one or both `AgentLoop`s, and `ask_user(text)` to
+  request clarification back. Kept deliberately dumb - all execution
+  lives in the per-Spot agents; the orchestrator is just a router so
+  failures localise to the routing decision.
+- **Default models everywhere = `gemini-3.1-flash-lite-preview`.** Same
+  default for agent / orchestrator / caption / recall, overridable per-
+  service from `scripts/config/mumt_hitl.yaml` (M3c) or `MUMT_*_MODEL`
+  env vars.
+- **Trace ring buffers** (last 5 steps per agent) for HUD overlays:
+  `(t_sim, thinking_oneline, speak_oneline, action_str)`. The single-
+  Spot script renders these on top of the POV pane; the multi-spot
+  script reuses the same panes from M-Agent.2.
+
+**Problems hit and how we solved them:**
+
+- **Mid-flight user message had to interrupt the agent immediately.**
+  A blocking `chat.send_message()` with a Future return would have made
+  the agent unresponsive between primitive ticks
+  -> `EventBus` is a bounded queue and the agent thread blocks on
+  `drain(timeout)`; a `UserMessage` lands on the bus the same way a
+  `ToolProgress` does, so the agent wakes within `heartbeat_s` of the
+  user pressing Enter. The agent then chooses whether to acknowledge
+  with `<speak>`, emit `stop()`, or carry on.
+- **Long primitives could starve the agent of context.** A 30 s
+  `search` with no events would have looked like a hung agent
+  -> controllers expose `progress_cb` (set by the dispatcher) and
+  emit per-viewpoint `ToolProgress` payloads; `format_event_for_llm`
+  renders them as `<event type="ToolProgress" ...>` blocks the agent
+  consumes. Dispatcher caps: `max_steps=20` LLM calls per goal,
+  `overall_timeout_s=600`, `per_call_timeout_s=20`.
+- **Chat history grew unbounded** -> 40-turn FIFO drops the oldest
+  user / model pairs while keeping the system prompt + few-shot
+  examples in place.
+
+**What we deliberately punted:**
+
+- **Cross-Spot tool calls.** No `ask(other_spot, ...)`. The current
+  workaround is the orchestrator: `tell(0, "ask spot 1 ...")`. Easy add
+  later once we have a real use case.
+- **Heartbeat events.** The agent only wakes on real tool / user
+  events; periodic world-state ticks are a flag in `loop.py` but
+  default off.
+- **Vision-to-agent.** Agents only see text; ambient captions remain
+  mediated through `recall`.
+- **Per-Spot state in `<state>` block** is a one-line summary today
+  (`coverage: 18/47 cells seen`); a richer payload waits until a
+  planning workload demands it.
+
+### M3c - VR-embodied human + LLM-driven Spots in the HITL app
+
+Landed in two phases. Phase C/D first stood up the custom HITL app
+(VR-embodied user + thumbstick teleop of Spot 0 + a server-side virtual-
+display framework). Phase E then grafted the M-Agent.\* autonomy stack
+into that app behind a single Hydra flag, so the same binary either
+plays the pure-VR demo or runs both Spots under their own LLMs.
+
+**Goal:** a single HITL server (`scripts/mumt_hitl_app.py`) where the
+user wears a Quest, *is* the humanoid, drives Spot 0 from the right
+thumbstick, sees Spot 1 doing its own thing under LLM control, talks
+to the orchestrator via push-to-talk, and points at things in the
+scene to disambiguate references.
+
+**Deliverable / how to run:**
+
+One-time prereq (replaces the `06_run_sim_viewer_server.sh` flow from
+M3a/b - same APK, same `adb reverse tcp:8888 tcp:8888`):
+
+```bash
+adb install -r third_party/siro_hitl_unity_client/Build/mumt_hitl_client.apk
+adb reverse tcp:8888 tcp:8888
+```
+
+Server (every session):
+
+```bash
+# Pure VR demo (no LLM, no captions, no detection).
+bash scripts/07_run_mumt_hitl_server.sh
+
+# VR + autonomy (per-Spot LLMs + orchestrator + STT + pointing).
+GEMINI_API_KEY=... \
+MUMT_YOLOE_URL=http://localhost:8080 \
+bash scripts/07_run_mumt_hitl_server.sh \
+    mumt.autonomy.enabled=true mumt.autonomy.stt.enabled=true
+```
+
+Quest control mapping (no APK rebuild needed - all bindings are
+server-side state machines reading `ClientState`):
+
+| Quest input              | Effect                                                                  |
+| ------------------------ | ----------------------------------------------------------------------- |
+| Headset pose             | Drives the humanoid's pelvis XZ + horizontal yaw                        |
+| Left thumbstick          | Walks the humanoid; new target shipped as `teleportAvatarBasePosition`  |
+| Right thumbstick         | Drives Spot 0 (forward + yaw, navmesh-clamped via `pathfinder.try_step`)|
+| Right A (`XRButton.ONE`) | Cycles HUD: `map` -> `spot0_pov` -> `spot1_pov` -> back                 |
+| Right B (`XRButton.TWO`) | **Hold** to take manual override of Spot 0 (LLM resumes 0.6 s after release) |
+| Right index trigger      | **Hold** for push-to-talk + pointing raycast (release transcribes + posts) |
+| Right thumbstick click   | Reset Spot 0 to spawn                                                   |
+
+**Conventions established here:**
+
+- **Phase C/D - VR baseline.**
+  - **Custom HITL app** = `scripts/mumt_hitl_app.py` + Hydra config
+    `scripts/config/mumt_hitl.yaml` + launcher
+    `scripts/07_run_mumt_hitl_server.sh`. Mirrors the `sim_viewer`
+    handshake conventions from M3a (headless, port 8888, mock
+    `isClientReady`) so the existing Quest APK keeps working.
+  - **User is the humanoid.** Per frame we snap the humanoid AO's pelvis
+    to `(headset.x, _humanoid_pelvis_lift_m, headset.z)` and rotate to
+    the headset's horizontal facing. Locomotion intent from the left
+    thumbstick is integrated into a target XZ on the navmesh and shipped
+    as a `teleportAvatarBasePosition` keyframe so the Quest's XR origin
+    follows along (handled client-side by `AvatarPositionHandler.cs` in
+    the existing `siro_hitl_unity_client` HEAD `dbfa5a6`).
+  - **`_LiftedSpotTeleop`** subclass writes the Spot AO's translation at
+    `navmesh_y + spot_base_lift_m` (~0.48 m, mirrors habitat-lab's
+    `SpotRobot` base offset) so the kinematic Spot doesn't sink into
+    the floor each push. Same fix shape as the humanoid pelvis lift.
+  - **Server-side virtual-display framework** in `mumt_sim/vr_displays.py`.
+    `DisplayManager` registers `Display` providers (each produces a
+    `PIL.Image` per tick) and pushes them under the `mumtDisplays` key
+    of the per-user keyframe message. The Unity client is a dumb
+    canvas: it gets `create` / `update` / `setVisible` / `destroy`
+    events with base64 JPEG payloads and paints the resulting quads
+    against `head` / `world` / `left_hand` / `right_hand` anchors. **No
+    APK rebuild for new HUDs.** Bandwidth budget: 256x192 JPEG q70 ~=
+    8 kB/frame, two POV displays at 15 Hz ~= 240 kB/s over adb-reverse
+    localhost.
+  - **Built-in displays:** `SpotPovDisplay` (first-person camera mounted
+    on a Spot AO via `sim.create_sensor(spec, spot_ao.root_scene_node)`),
+    `TopDownMapDisplay` (coverage-aware top-down map), `TextDisplay`
+    (callable -> string -> JPEG), `AlertWedgeDisplay` (warning panel).
+    The HUD cycle is `[map, spot0_pov, spot1_pov]` (3 modes since the
+    autonomy phase asked for it); status text is a permanent panel
+    outside the cycle.
+
+- **Phase E - autonomy in VR.** Everything below is gated by
+  `mumt.autonomy.enabled` (default `false`). The pure-VR path stays
+  pixel-identical when the flag is off, so the demo doesn't regress
+  if a host is missing `google-genai` / `requests` / `sounddevice`.
+  - **Per-Spot RGB+depth `SpotHeadCam`** in `mumt_sim/agent/head_cam.py`.
+    Both sensors are parked on the Spot AO's root scene node (same
+    pattern `SpotPovDisplay` already used) so head pose tracks the body
+    automatically and the autonomy stack + the HUD POV display share a
+    single render path. `cam_T_world()` reads
+    `self._color_sensor.node.absolute_transformation()` directly;
+    `CoverageMap.cam_T_world_from_sensor(sensor)` was added to consume
+    that without going through a habitat agent.
+  - **Per-tick order in `AppStateMumt.sim_update`** (load-bearing):
+    1. read `RemoteClientState`,
+    2. manual-override gate,
+    3. step the active controller for each Spot,
+    4. render the `SpotHeadCam` RGB + depth,
+    5. update `CoverageMap` from depth + `cam_T_world`,
+    6. `CaptionWorker.post_observation(...)`,
+    7. refresh the per-Spot `state_snapshot` dict that `AgentLoop.get_state`
+       reads (includes `user_pose_xz` from the humanoid AO so the
+       orchestrator can refer to "the user").
+  - **Manual override of Spot 0** = right B held. While held,
+    `dispatcher.request_stop(0)` fires once and the right thumbstick
+    is rerouted to a direct teleop of Spot 0 via `_drive_spot0_from_right_thumbstick`.
+    On release we wait `_OVERRIDE_RELEASE_S = 0.6` of deadzone-stick-time
+    before letting the LLM regain Spot 0; short enough to feel
+    responsive, long enough to ride out brief returns to neutral.
+  - **Push-to-talk + STT** in `mumt_sim/agent/voice.py`. `PushToTalkRecorder`
+    opens a `sounddevice.InputStream` at 16 kHz mono on right-trigger
+    rising edge and drains on falling edge. Two STT backends: Gemini
+    (default; reuses `GEMINI_API_KEY`) and ElevenLabs Scribe (needs
+    `ELEVENLABS_API_KEY` + the `elevenlabs` SDK). All four optional
+    dependencies (`google-genai`, `requests`, `sounddevice`, `elevenlabs`)
+    are import-guarded - missing any one of them surfaces a single
+    startup warning and the rest of the stack keeps working.
+  - **Pointing** in `mumt_sim/agent/pointing.py`. While PTT is active,
+    we sample the right-controller pose every tick and run two
+    raycasts: `sim.cast_ray()` against the scene and an analytic plane
+    intersection against the HUD top-down quad. Closest hit wins; on
+    PTT release the transcript is prepended with
+    `(user pointed to (x, y, z))` before being posted to the
+    orchestrator. Toggleable under `mumt.pointing.{enabled, max_dist_m}`
+    (default on, 25 m).
+  - **Hydra config** `scripts/config/mumt_hitl.yaml` exposes the entire
+    autonomy / STT / pointing surface (`mumt.autonomy.{enabled,
+    agent_model, orchestrator_model, caption_model, recall_model,
+    yoloe_url, stt.{enabled, backend, model, sample_rate}}`,
+    `mumt.pointing.{enabled, max_dist_m}`,
+    `mumt.{spot_base_lift_m, humanoid_pelvis_lift_m}`). Defaults match
+    what the M-Agent.\* scripts use so behaviour is consistent across
+    entry points.
+  - **Optional dependencies** are split into `[autonomy]` (`google-genai`,
+    `requests`, `opencv-python`) and `[voice]` (`elevenlabs`, `sounddevice`)
+    extras in `pyproject.toml`; `requirements.txt` keeps the union for
+    the dev workflow. The basic VR demo doesn't pull any of them.
+
+**Problems hit and how we solved them:**
+
+- **`SimDriver` originally skipped texture loading**, so adding more
+  `CameraSensor`s post-init returned blank rasters
+  -> a small patch we maintain forces texture loading; once that
+  landed `SpotPovDisplay` + `SpotHeadCam` both render correctly even
+  though they're attached after the initial sim configure.
+- **Three+ extra `CameraSensor`s per tick (per-Spot RGB + depth + HUD
+  POV) tanked frame rate** when all four ran at the same 480x640 the
+  M-Agent.2 teleop uses
+  -> the autonomy stack runs head sensors at 320x240 (good enough
+  for captions, detection, depth back-projection) independently of
+  the HUD POV resolution. Tunable per-display in `vr_displays.py`.
+- **`ClientState.avatar.hands` arrives in habitat coords, but the
+  Unity-side controller forward is `-Z` Unity** (left-handed)
+  -> pointing logic builds the world-space ray from the right-hand
+  pose and rotates Unity's `-Z` to habitat's `+X` via the same basis
+  trick `PanTiltHead` uses. Documented in `pointing.py`.
+- **`sim.cast_ray` availability differs between habitat-sim builds.**
+  On the HITL build it's there but the API path varies
+  -> `pointing.raycast_world` probes both `Simulator.cast_ray` and
+  `PathFinder.cast_ray` at startup; if neither is available we fall
+  back to HUD-quad-only pointing and log a warning.
+- **`_LiftedSpotTeleop._push()` is called from the base
+  `__init__`** before subclass attributes are set
+  -> the subclass sets `self._body_lift_y` *before* delegating to
+  `super().__init__()` and re-anchors `state.position` to the
+  navmesh level after, so subsequent `try_step`s stay consistent
+  with the lifted AO write.
+- **Autonomy state crossed thread boundaries** (per-Spot snapshots
+  read by `AgentLoop`, written by the main sim thread)
+  -> a single `threading.Lock` per `AppStateMumt._state_lock`
+  guards a `state_snapshots: List[Dict]`; `AgentLoop.get_state`
+  takes a snapshot copy under the lock and returns. No habitat-sim
+  call ever happens off-thread.
+
+**What we deliberately punted (still on the radar):**
+
+- **Quest head-tracking yaw/pitch axis convention** from M3b is still
+  off; physical head turns produce inconsistent scene rotation.
+  Triage moved from "early M3c" to "after autonomy lands"; the bug
+  is in `CoordinateSystem.cs` on the Unity side and needs an APK
+  rebuild.
+- **The 170 missing furniture imports from M3b** are still missing -
+  the stage GLB renders, but the objects don't. No new info on the
+  GLTFUtility URP shader-import workers issue.
+- **Cross-Spot tool calls** (`ask(other_spot, ...)`). Same situation
+  as M-Agent.3: the orchestrator is the workaround for now.
+- **Embodied SMPL-X gait.** The humanoid root snaps to the headset
+  but legs don't animate; we hide the avatar in the GUI viewport
+  (`hide_humanoid_in_gui: True`) so the user doesn't see their own
+  pelvis. A future multi-user observer view will need an animated
+  rig.
+- **Whisper / on-device STT.** Earlier plan called for `faster-whisper`
+  but we landed on a Gemini STT default (no extra model download,
+  no GPU) plus an ElevenLabs Scribe option for paid users. Local
+  Whisper can slot back in as a third backend if API latency becomes
+  a problem.
